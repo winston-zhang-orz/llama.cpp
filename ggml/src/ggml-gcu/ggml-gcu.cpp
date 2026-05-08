@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <mutex>
+#include <string>
 
 // === Error handling =================================================
 
@@ -78,6 +79,46 @@ static void gcu_global_init_dec() {
     }
 }
 
+// === Per-context state ==============================================
+
+#define GGML_GCU_NAME_MAX 64
+
+struct ggml_backend_gcu_context {
+    int32_t      device      = 0;
+    std::string  name;          // "GCU0", "GCU1", ...
+    std::string  description;   // populated from topsGetDeviceProperties
+    topsStream_t stream        = nullptr;
+
+    explicit ggml_backend_gcu_context(int32_t dev) : device(dev) {
+        TOPS_CHECK(topsSetDevice(device));
+        gcu_global_init_inc();
+        TOPS_CHECK(topsStreamCreate(&stream));
+
+        char buf[GGML_GCU_NAME_MAX];
+        snprintf(buf, sizeof(buf), "GCU%d", device);
+        name = buf;
+
+        topsDeviceProp_t prop{};
+        if (topsGetDeviceProperties(&prop, device) == topsSuccess) {
+            description = prop.name;
+        } else {
+            description = "Enflame GCU";
+        }
+    }
+
+    ~ggml_backend_gcu_context() {
+        if (stream) {
+            TOPS_CHECK(topsStreamSynchronize(stream));
+            TOPS_CHECK(topsStreamDestroy(stream));
+            stream = nullptr;
+        }
+        gcu_global_init_dec();
+    }
+
+    ggml_backend_gcu_context(const ggml_backend_gcu_context &) = delete;
+    ggml_backend_gcu_context & operator=(const ggml_backend_gcu_context &) = delete;
+};
+
 // === Stubs (filled in subsequent phases) =============================
 
 extern "C" {
@@ -88,13 +129,21 @@ int32_t ggml_backend_gcu_get_device_count(void) {
     return count;
 }
 
-void ggml_backend_gcu_get_device_description(int32_t /*device*/, char * description, size_t description_size) {
-    snprintf(description, description_size, "Enflame GCU");
+void ggml_backend_gcu_get_device_description(int32_t device, char * description, size_t description_size) {
+    topsDeviceProp_t prop{};
+    if (topsGetDeviceProperties(&prop, device) == topsSuccess) {
+        snprintf(description, description_size, "%s", prop.name);
+    } else {
+        snprintf(description, description_size, "Enflame GCU device %d", device);
+    }
 }
 
-void ggml_backend_gcu_get_device_memory(int32_t /*device*/, size_t * free, size_t * total) {
-    *free = 0;
-    *total = 0;
+void ggml_backend_gcu_get_device_memory(int32_t device, size_t * free, size_t * total) {
+    int prev = 0;
+    TOPS_CHECK(topsGetDevice(&prev));
+    TOPS_CHECK(topsSetDevice(device));
+    TOPS_CHECK(topsMemGetInfo(free, total));
+    TOPS_CHECK(topsSetDevice(prev));
 }
 
 bool ggml_backend_is_gcu(ggml_backend_t /*backend*/) {
