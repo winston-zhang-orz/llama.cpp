@@ -595,6 +595,38 @@ static bool gcu_op_scale(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// MVP-1: GET_ROWS handles only the unbatched case (in is effectively 2D
+// [n, m], idx is 1D [r]). Batched GET_ROWS (be1>1 or be2>1) goes to CPU.
+static bool gcu_op_get_rows(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * in_t  = dst->src[0];
+    ggml_tensor * idx_t = dst->src[1];
+
+    // Treat in as 2D (rank-trim trailing 1s) → topsaten dim 0 picks along the
+    // ggml "rows" axis (ne[1]).
+    int64_t in_dims[2]  = { in_t->ne[1], in_t->ne[0] };       // PyTorch order: [m, n]
+    int64_t in_strs[2]  = { (int64_t) (in_t->nb[1] / ggml_type_size(in_t->type)),
+                            (int64_t) (in_t->nb[0] / ggml_type_size(in_t->type)) };
+    topsatenSize_t in_shape (in_dims, 2);
+    topsatenSize_t in_stride(in_strs, 2);
+    topsatenTensor in_tt(in_shape, in_stride, ggml_to_topsaten_dtype(in_t->type), in_t->data);
+
+    int64_t out_dims[2] = { dst->ne[1], dst->ne[0] };
+    int64_t out_strs[2] = { (int64_t) (dst->nb[1] / ggml_type_size(dst->type)),
+                            (int64_t) (dst->nb[0] / ggml_type_size(dst->type)) };
+    topsatenSize_t out_shape (out_dims, 2);
+    topsatenSize_t out_stride(out_strs, 2);
+    topsatenTensor out_tt(out_shape, out_stride, ggml_to_topsaten_dtype(dst->type), dst->data);
+
+    int64_t idx_dims[1] = { idx_t->ne[0] };
+    int64_t idx_strs[1] = { 1 };
+    topsatenSize_t idx_shape (idx_dims, 1);
+    topsatenSize_t idx_stride(idx_strs, 1);
+    topsatenTensor idx_tt(idx_shape, idx_stride, TOPSATEN_DATA_I32, idx_t->data);
+
+    TOPSATEN_CHECK(topsatenIndexSelect(out_tt, in_tt, /*dim=*/0, idx_tt, ctx->stream));
+    return true;
+}
+
 static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_RESHAPE:
@@ -608,6 +640,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_mul(ctx, node);
         case GGML_OP_SCALE:
             return gcu_op_scale(ctx, node);
+        case GGML_OP_GET_ROWS:
+            return gcu_op_get_rows(ctx, node);
         default:
             return false;
     }
@@ -735,6 +769,21 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             const float bias = params[1];
             // MVP-1: only support pure scale (bias = 0). scale_bias goes to CPU.
             return gcu_all_inputs_supported_dtype(op) && bias == 0.0f;
+        }
+        case GGML_OP_GET_ROWS: {
+            const ggml_tensor * in  = op->src[0];
+            const ggml_tensor * idx = op->src[1];
+            if (!in || !idx) return false;
+            if (idx->type != GGML_TYPE_I32) return false;
+            // MVP-1: only F32 in/out. topsatenIndexSelect's docs claim F16
+            // support but it returns BAD_PARAM at runtime on this SDK
+            // version; revisit in MVP-2.
+            if (in->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+            // Unbatched only (in is effectively 2D, idx is 1D, both contiguous).
+            if (in->ne[2] != 1 || in->ne[3] != 1) return false;
+            if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) return false;
+            if (!ggml_is_contiguous(idx)) return false;
+            return true;
         }
         default:
             return false;
