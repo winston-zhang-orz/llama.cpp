@@ -549,6 +549,52 @@ static bool gcu_op_mul(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+static bool gcu_op_scale(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    float params[2];
+    memcpy(params, dst->op_params, sizeof(params));
+    const float scale = params[0];
+    // bias != 0 is rejected upstream by supports_op for MVP-1.
+
+    ggml_tensor * lhs_t = dst->src[0];
+
+    void * scratch = nullptr;
+    size_t scratch_bytes = 0;
+    void * lhs_data = lhs_t->data;
+    if (gcu_dst_aliases_src0_at_runtime(dst)) {
+        scratch_bytes = ggml_nbytes(lhs_t);
+        scratch       = ctx->pool.alloc(scratch_bytes);
+        TOPS_CHECK(topsMemcpyAsync(scratch, lhs_data, scratch_bytes,
+                                   topsMemcpyDeviceToDevice, ctx->stream));
+        lhs_data = scratch;
+    }
+
+    gcu_tensor_dims dout, dlhs;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+
+    {
+        const size_t bpe = ggml_type_size(lhs_t->type);
+        int rank = ggml_n_dims(lhs_t); if (rank < 1) rank = 1;
+        for (int i = 0; i < rank; i++) {
+            dlhs.dims[i] = lhs_t->ne[rank - 1 - i];
+            dlhs.strs[i] = lhs_t->nb[rank - 1 - i] / (int64_t) bpe;
+        }
+        topsatenSize_t shape (dlhs.dims, rank);
+        topsatenSize_t stride(dlhs.strs, rank);
+        topsatenTensor lhs(shape, stride, ggml_to_topsaten_dtype(lhs_t->type), lhs_data);
+
+        topsatenScalar_t s;
+        s.dtype = TOPSATEN_DATA_FP32;
+        s.fval  = scale;
+        TOPSATEN_CHECK(topsatenMul(out, lhs, s, ctx->stream));
+    }
+
+    if (scratch) {
+        TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+        ctx->pool.free(scratch, scratch_bytes);
+    }
+    return true;
+}
+
 static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_RESHAPE:
@@ -560,6 +606,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_add(ctx, node);
         case GGML_OP_MUL:
             return gcu_op_mul(ctx, node);
+        case GGML_OP_SCALE:
+            return gcu_op_scale(ctx, node);
         default:
             return false;
     }
@@ -681,6 +729,13 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
         case GGML_OP_MUL:
             return gcu_all_inputs_supported_dtype(op) &&
                    gcu_numpy_broadcastable(op->src[0], op->src[1]);
+        case GGML_OP_SCALE: {
+            float params[2];
+            memcpy(params, op->op_params, sizeof(params));
+            const float bias = params[1];
+            // MVP-1: only support pure scale (bias = 0). scale_bias goes to CPU.
+            return gcu_all_inputs_supported_dtype(op) && bias == 0.0f;
+        }
         default:
             return false;
     }
