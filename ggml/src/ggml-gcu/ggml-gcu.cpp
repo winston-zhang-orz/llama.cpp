@@ -12,6 +12,12 @@
 #include <topsaten/topsaten.h>
 #include <tops/tops_runtime.h>
 
+// topsaten functions (Add, Mul, Linear, IndexSelect, Copy, To, ...) live in
+// the topsaten:: namespace. The types (topsatenTensor, topsatenScalar_t,
+// topsatenStatus_t, ...) are at global scope. Pull the namespace in for
+// readability since this whole file is a topsaten wrapper.
+using namespace topsaten;
+
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -322,8 +328,9 @@ static const char * ggml_backend_gcu_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_gcu_free(ggml_backend_t backend) {
-    auto * ctx = (ggml_backend_gcu_context *) backend->context;
-    delete ctx;
+    // Backend's context is non-owning — the actual ggml_backend_gcu_context
+    // lives in the registry's device descriptor and outlives the backend
+    // wrapper. Only delete the wrapper.
     delete backend;
 }
 
@@ -332,8 +339,25 @@ static void ggml_backend_gcu_synchronize(ggml_backend_t backend) {
     TOPS_CHECK(topsStreamSynchronize(ctx->stream));
 }
 
-static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t /*backend*/, struct ggml_cgraph * /*cgraph*/) {
-    GGML_ABORT("ggml_backend_gcu_graph_compute not implemented yet");
+// Forward declaration: gcu_compute_node lives in the Op dispatch section
+// further down in the file.
+static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node);
+
+static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    auto * ctx = (ggml_backend_gcu_context *) backend->context;
+    TOPS_CHECK(topsSetDevice(ctx->device));
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_empty(node) || node->op == GGML_OP_NONE) continue;
+        if (!gcu_compute_node(ctx, node)) {
+            GGML_LOG_ERROR("%s: op %s not implemented or failed\n",
+                           __func__, ggml_op_name(node->op));
+            return GGML_STATUS_FAILED;
+        }
+    }
+    TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+    return GGML_STATUS_SUCCESS;
 }
 
 static const ggml_backend_i ggml_backend_gcu_i = {
@@ -399,6 +423,104 @@ static topsatenTensor make_topsaten_tensor(const ggml_tensor * t, gcu_tensor_dim
     topsatenSize_t stride(out_dims.strs, rank);
 
     return topsatenTensor(shape, stride, dtype, t->data);
+}
+
+// === Op dispatch =====================================================
+
+static bool gcu_dtype_supported(ggml_type t) {
+    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16;
+}
+
+static bool gcu_all_inputs_supported_dtype(const ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && !gcu_dtype_supported(op->src[i]->type)) return false;
+    }
+    return gcu_dtype_supported(op->type);
+}
+
+// topsaten's elementwise ops accept numpy/PyTorch-style broadcasting
+// (each dim must be equal or one operand's dim is 1). ggml additionally
+// allows "tiled" broadcasting (a->ne[i] is a multiple of b->ne[i]) which
+// topsaten does not support; refuse those cases so the scheduler keeps
+// them on CPU.
+static bool gcu_numpy_broadcastable(const ggml_tensor * a, const ggml_tensor * b) {
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (a->ne[i] != b->ne[i] && a->ne[i] != 1 && b->ne[i] != 1) return false;
+    }
+    return true;
+}
+
+// topsaten's binary ops reject aliased output and lhs. This happens
+// for ggml's in-place variants (dst->view_src == src[0]) AND for
+// ordinary non-inplace ops when ggml-alloc's memory reuser places
+// dst's slab over src[0]'s slab. Detect both at compute time via
+// data-pointer comparison and route through a scratch copy.
+static bool gcu_dst_aliases_src0_at_runtime(const ggml_tensor * dst) {
+    return dst->src[0] && dst->data && dst->src[0]->data &&
+           dst->data == dst->src[0]->data;
+}
+
+static bool gcu_op_add(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * lhs_t = dst->src[0];
+    ggml_tensor * rhs_t = dst->src[1];
+
+    // If dst aliases lhs (in-place op or memory reuse), copy lhs into a
+    // scratch slab and use that as the topsatenAdd lhs. The scratch is
+    // returned to the pool after the op completes on the stream.
+    void * scratch = nullptr;
+    size_t scratch_bytes = 0;
+    void * lhs_data = lhs_t->data;
+    if (gcu_dst_aliases_src0_at_runtime(dst)) {
+        scratch_bytes = ggml_nbytes(lhs_t);
+        scratch       = ctx->pool.alloc(scratch_bytes);
+        TOPS_CHECK(topsMemcpyAsync(scratch, lhs_data, scratch_bytes,
+                                   topsMemcpyDeviceToDevice, ctx->stream));
+        lhs_data = scratch;
+    }
+
+    gcu_tensor_dims dout, dlhs, drhs;
+    topsatenTensor out = make_topsaten_tensor(dst,   dout);
+
+    // Build lhs manually using lhs_data (may be the scratch pointer).
+    {
+        const size_t bpe = ggml_type_size(lhs_t->type);
+        int rank = ggml_n_dims(lhs_t); if (rank < 1) rank = 1;
+        for (int i = 0; i < rank; i++) {
+            dlhs.dims[i] = lhs_t->ne[rank - 1 - i];
+            dlhs.strs[i] = lhs_t->nb[rank - 1 - i] / (int64_t) bpe;
+        }
+        topsatenSize_t shape (dlhs.dims, rank);
+        topsatenSize_t stride(dlhs.strs, rank);
+        topsatenTensor lhs(shape, stride, ggml_to_topsaten_dtype(lhs_t->type), lhs_data);
+        topsatenTensor rhs = make_topsaten_tensor(rhs_t, drhs);
+
+        topsatenScalar_t alpha;
+        alpha.dtype = TOPSATEN_DATA_FP32;
+        alpha.fval  = 1.0;
+        TOPSATEN_CHECK(topsatenAdd(out, lhs, rhs, alpha, ctx->stream));
+    }
+
+    if (scratch) {
+        // Synchronize before returning the scratch to the pool: the op is
+        // queued on the stream and reading from scratch must complete.
+        TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+        ctx->pool.free(scratch, scratch_bytes);
+    }
+    return true;
+}
+
+static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;        // metadata-only, nothing to launch
+        case GGML_OP_ADD:
+            return gcu_op_add(ctx, node);
+        default:
+            return false;
+    }
 }
 
 // === Device interface ================================================
@@ -489,8 +611,36 @@ static ggml_backend_t ggml_backend_gcu_device_init_backend(ggml_backend_dev_t de
     return b;
 }
 
-static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, const ggml_tensor * /*op*/) {
-    return false;   // filled in starting Phase E
+// Resolve a device id to the shared context owned by the registry's
+// device descriptor. Defined here (after device_context) so it can call
+// dctx->get_ctx().
+static ggml_backend_gcu_context * gcu_get_shared_ctx_for_device(int32_t device) {
+    ggml_backend_reg_t reg = ggml_backend_gcu_reg();
+    size_t n = ggml_backend_reg_dev_count(reg);
+    for (size_t i = 0; i < n; i++) {
+        ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, i);
+        auto * d = (ggml_backend_gcu_device_context *) dev->context;
+        if (d->device == device) {
+            return d->get_ctx();
+        }
+    }
+    GGML_ABORT("ggml-gcu: unknown device %d", device);
+}
+
+static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, const ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        case GGML_OP_ADD:
+            return gcu_all_inputs_supported_dtype(op) &&
+                   gcu_numpy_broadcastable(op->src[0], op->src[1]);
+        default:
+            return false;
+    }
 }
 
 static bool ggml_backend_gcu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -543,6 +693,10 @@ static const ggml_backend_reg_i ggml_backend_gcu_reg_i = {
     /* .get_proc_address = */ nullptr,
 };
 
+// Forward decl so ggml_backend_gcu_init can locate the device's shared ctx.
+// Definition lives below ggml_backend_gcu_device_context.
+static ggml_backend_gcu_context * gcu_get_shared_ctx_for_device(int32_t device);
+
 // === Stubs (filled in subsequent phases) =============================
 
 extern "C" {
@@ -581,23 +735,36 @@ ggml_backend_t ggml_backend_gcu_init(int32_t device) {
         return nullptr;
     }
 
-    auto * ctx = new ggml_backend_gcu_context(device);
+    // Use the device's shared context. Sharing means buffer copies and
+    // graph_compute use the same stream, so set_tensor / get_tensor
+    // ordering is correct without extra event coordination.
+    ggml_backend_gcu_context * ctx = gcu_get_shared_ctx_for_device(device);
 
     auto * backend = new ggml_backend{
         /* .guid    = */ ggml_backend_gcu_guid(),
         /* .iface   = */ ggml_backend_gcu_i,
-        /* .device  = */ nullptr,         // filled in by device.init_backend (Phase C)
+        /* .device  = */ nullptr,    // patched by device.init_backend
         /* .context = */ ctx,
     };
     return backend;
 }
 
 ggml_backend_reg_t ggml_backend_gcu_reg(void) {
-    static ggml_backend_reg              s_reg{};
-    static ggml_backend_gcu_reg_context  s_rctx{};
-    static std::once_flag                once;
+    // The registry, its device descriptors, and each device's lazy
+    // ggml_backend_gcu_context are intentionally heap-leaked. C++ static
+    // destructors otherwise run during process exit AFTER topsrt has torn
+    // down its own runtime, and any topsStreamSynchronize/topsStreamDestroy
+    // call from our destructors then segfaults inside libefrt. Letting the
+    // OS reclaim the memory at exit is the standard pattern for SDK-backed
+    // singletons (CUDA/CANN do the same).
+    static ggml_backend_reg *             s_reg  = nullptr;
+    static ggml_backend_gcu_reg_context * s_rctx = nullptr;
+    static std::once_flag                 once;
 
     std::call_once(once, [] {
+        s_reg  = new ggml_backend_reg{};
+        s_rctx = new ggml_backend_gcu_reg_context{};
+
         int n = ggml_backend_gcu_get_device_count();
         for (int i = 0; i < n; i++) {
             char name_buf[GGML_GCU_NAME_MAX];
@@ -617,20 +784,20 @@ ggml_backend_reg_t ggml_backend_gcu_reg(void) {
 
             auto dev = std::unique_ptr<ggml_backend_device>(new ggml_backend_device{
                 /* .iface   = */ ggml_backend_gcu_device_i,
-                /* .reg     = */ &s_reg,
+                /* .reg     = */ s_reg,
                 /* .context = */ dctx.get(),
             });
-            s_rctx.devs.push_back(std::move(dev));
-            s_rctx.dev_ctxs.push_back(std::move(dctx));
+            s_rctx->devs.push_back(std::move(dev));
+            s_rctx->dev_ctxs.push_back(std::move(dctx));
         }
 
-        s_reg = ggml_backend_reg{
+        *s_reg = ggml_backend_reg{
             /* .api_version = */ GGML_BACKEND_API_VERSION,
             /* .iface       = */ ggml_backend_gcu_reg_i,
-            /* .context     = */ &s_rctx,
+            /* .context     = */ s_rctx,
         };
     });
-    return &s_reg;
+    return s_reg;
 }
 
 } // extern "C"
