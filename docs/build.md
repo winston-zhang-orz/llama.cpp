@@ -531,12 +531,27 @@ If the SDK is installed to a non-standard path, override with `-DTOPS_INSTALL_DI
 ./build/bin/test-backend-ops -b GCU0 -o ADD  # exercises ADD across many shapes/dtypes
 ```
 
-### MVP-1 limitations
+### Operator coverage (MVP-2)
 
-The current backend implements a deliberately small op set so that real models will mostly route through CPU. Operators wired up to GCU:
+The following ops are implemented on GCU. Any op or shape outside these is automatically routed to CPU by ggml's scheduler:
 
-- `ADD`, `MUL`, `SCALE` (no bias), `MUL_MAT` (F32 only), `CPY/DUP/CONT` (same dtype, contiguous), `GET_ROWS` (F32, unbatched), and view-class ops (`RESHAPE`, `VIEW`, `PERMUTE`, `TRANSPOSE`).
-- Quantized weights (Q4_K, Q8_0, etc.) stay on CPU. Single device, single stream, no pinned host buffer. Multi-device, native quantized matmul, F16 MUL_MAT, and graph-mode execution are tracked for follow-up MVPs.
+- Element-wise: `ADD`, `MUL`, `SCALE` (bias = 0 only)
+- Activations: `SILU`
+- Normalization: `RMS_NORM`
+- Position encoding: `ROPE` (mode 0 only — no NEOX, no YARN, no MROPE; F32 only)
+- Reduction: `SOFT_MAX` (with optional mask, `max_bias = 0`, no softmax sinks)
+- Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast)
+- Indexing: `GET_ROWS` (F32 only, unbatched), `SET_ROWS` (F32 dst only — KV cache stays on CPU)
+- Memory: `CPY`/`DUP`/`CONT` (same-dtype contiguous + F32↔F16 conversion); view ops (`RESHAPE`, `VIEW`, `PERMUTE`, `TRANSPOSE`)
+
+### Known limitations (MVP-2)
+
+- Quantized weights (Q4_K, Q8_0, etc.) stay on CPU. Models load fine; compute on quantized tensors is CPU-bound.
+- KV cache is designed to stay on CPU. `SET_ROWS` to F16 destinations (the cache dtype) is refused on GCU. Real-model use with `--device GCU0` currently aborts at graph_reserve because llama.cpp pre-allocates the cache on the chosen device — an MVP-3 work item to plumb cache placement appropriately. Use `-ngl 0` to keep the backend loaded without offloading anything.
+- BF16 not supported.
+- Only `ROPE` mode 0 is implemented; YARN / NEOX / MROPE go to CPU. F16 ROPE is also CPU-only on this SDK version.
+- `SOFT_MAX` with `max_bias != 0` (alibi) and `softmax sinks` (a non-null `op->src[2]`) go to CPU.
+- Single device, single stream, no pinned host memory. Multi-device, async overlap, native quantized matmul are MVP-3+ work.
 
 ## ZenDNN
 
