@@ -495,6 +495,49 @@ llama_new_context_with_model:       CANN compute buffer size =  1260.81 MiB
 
 For detailed info, such as model/device supports, CANN install, please refer to [llama.cpp for CANN](./backend/CANN.md).
 
+## GCU (Enflame TopsRider)
+
+llama.cpp can run on Enflame GCU devices (e.g. S60) via the `ggml-gcu` backend. The backend wraps Enflame's high-level operator library (`topsaten`) and the device runtime (`topsrt`).
+
+### Prerequisites
+
+Install Enflame's TopsRider SDK packages on the build host (Debian/Ubuntu):
+
+- `tops-sdk` provides the runtime headers and `libtopsrt.so` under `/opt/tops`.
+- `topsaten` provides the operator library at `/usr/lib/libtopsaten.so` and headers under `/opt/tops/include/gcu/topsaten`.
+
+Verify the install before configuring:
+
+```bash
+ls /opt/tops/include/gcu/topsaten/topsaten.h   # headers
+ls /usr/lib/libtopsaten.so                     # operator library
+ls /opt/tops/lib/libtopsrt.so                  # device runtime
+```
+
+### Build
+
+```bash
+cmake -B build -DGGML_GCU=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
+
+If the SDK is installed to a non-standard path, override with `-DTOPS_INSTALL_DIR=/path/to/tops`.
+
+### Verify
+
+```bash
+./build/bin/llama-cli --list-devices         # GCU0 should appear with its memory size
+./build/bin/test-backend-gcu                 # smoke test: ADD + MUL_MAT vs CPU
+./build/bin/test-backend-ops -b GCU0 -o ADD  # exercises ADD across many shapes/dtypes
+```
+
+### MVP-1 limitations
+
+The current backend implements a deliberately small op set so that real models will mostly route through CPU. Operators wired up to GCU:
+
+- `ADD`, `MUL`, `SCALE` (no bias), `MUL_MAT` (F32 only), `CPY/DUP/CONT` (same dtype, contiguous), `GET_ROWS` (F32, unbatched), and view-class ops (`RESHAPE`, `VIEW`, `PERMUTE`, `TRANSPOSE`).
+- Quantized weights (Q4_K, Q8_0, etc.) stay on CPU. Single device, single stream, no pinned host buffer. Multi-device, native quantized matmul, F16 MUL_MAT, and graph-mode execution are tracked for follow-up MVPs.
+
 ## ZenDNN
 
 ZenDNN provides optimized deep learning primitives for AMD EPYC™ CPUs. It accelerates matrix multiplication operations for inference workloads.
