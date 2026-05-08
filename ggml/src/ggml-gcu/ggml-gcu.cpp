@@ -355,6 +355,52 @@ static const ggml_backend_i ggml_backend_gcu_i = {
     /* .graph_optimize       = */ nullptr,
 };
 
+// === Tensor mapping =================================================
+//
+// Convert a ggml_tensor descriptor into a topsatenTensor that wraps the
+// same device memory. Caller must keep the underlying ggml_tensor (and
+// its buffer) alive for the duration of any op call using this wrapper.
+
+static topsatenDataType_t ggml_to_topsaten_dtype(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32: return TOPSATEN_DATA_FP32;
+        case GGML_TYPE_F16: return TOPSATEN_DATA_FP16;
+        case GGML_TYPE_I32: return TOPSATEN_DATA_I32;
+        default:            return TOPSATEN_DATA_NONE;
+    }
+}
+
+// Per-tensor scratch for shape/stride arrays the topsatenSize_t pointers
+// must outlive. We carry them inline so the helper is self-contained.
+struct gcu_tensor_dims {
+    int64_t dims [GGML_MAX_DIMS];
+    int64_t strs [GGML_MAX_DIMS];
+};
+
+static topsatenTensor make_topsaten_tensor(const ggml_tensor * t, gcu_tensor_dims & out_dims) {
+    GGML_ASSERT(t != nullptr);
+    GGML_ASSERT(t->data != nullptr);
+
+    topsatenDataType_t dtype = ggml_to_topsaten_dtype(t->type);
+    GGML_ASSERT(dtype != TOPSATEN_DATA_NONE);
+
+    int rank = ggml_n_dims(t);
+    if (rank < 1)             rank = 1;
+    if (rank > GGML_MAX_DIMS) rank = GGML_MAX_DIMS;
+
+    // ggml stores ne[]/nb[] in slowest-last reversed-PyTorch order.
+    // Build PyTorch order (slowest first), with strides in elements.
+    const size_t bpe = ggml_type_size(t->type);
+    for (int i = 0; i < rank; i++) {
+        out_dims.dims[i] = t->ne[rank - 1 - i];
+        out_dims.strs[i] = t->nb[rank - 1 - i] / (int64_t) bpe;
+    }
+    topsatenSize_t shape (out_dims.dims, rank);
+    topsatenSize_t stride(out_dims.strs, rank);
+
+    return topsatenTensor(shape, stride, dtype, t->data);
+}
+
 // === Device interface ================================================
 
 #include <memory>
