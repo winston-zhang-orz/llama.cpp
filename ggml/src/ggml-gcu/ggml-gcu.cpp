@@ -690,33 +690,65 @@ static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 // ggml's ggml_set_rows packs args unusually: result is a view of `a`
 // (destination), and the node's slots are:
 //   src[0] = b   (source rows)
-//   src[1] = c   (row indices, I32)
+//   src[1] = c   (row indices)
 //   src[2] = a   (destination — written in place via the view)
-// See ggml.c around ggml_set_rows for the legacy ordering.
 //
-// Maps to topsatenIndexPut(self=dst, indices=[idx], value=src, accumulate=false).
-// MVP scope: F32 dst/src (matches GET_ROWS), I32 indices, unbatched 2D dst,
-// 1D idx, no accumulate.
+// We flatten both src and dst to 2D [n_rows, row_size] where row_size is
+// the innermost ggml dim (ne[0]) and n_rows is the product of the rest.
+// This handles KV-cache shapes like [head_dim, n_heads, max_kv] where
+// the cache is logically a 2D table of (n_heads * max_kv) rows of
+// head_dim elements. Requires the tensor to be contiguous.
+//
+// llama.cpp stores K/V in F16 caches but produces F32 K/V vectors during
+// compute, so src->type != dst->type is the common case. topsatenIndexPut
+// requires matching dtypes, so we cast src into a per-context scratch
+// when types differ.
 static bool gcu_op_set_rows(ggml_backend_gcu_context * ctx, ggml_tensor * node) {
-    ggml_tensor * src = node->src[0];   // source rows
-    ggml_tensor * idx = node->src[1];   // row indices
-    ggml_tensor * dst = node->src[2];   // destination (also aliased by node)
+    ggml_tensor * src = node->src[0];
+    ggml_tensor * idx = node->src[1];
+    ggml_tensor * dst = node->src[2];
 
-    // self: dst, treated as 2D [m, n] (PyTorch order).
-    int64_t self_d[2] = { dst->ne[1], dst->ne[0] };
-    int64_t self_s[2] = { (int64_t) (dst->nb[1] / ggml_type_size(dst->type)),
-                          (int64_t) (dst->nb[0] / ggml_type_size(dst->type)) };
+    auto flat_2d = [](const ggml_tensor * t, int64_t (& d)[2], int64_t (& s)[2]) {
+        d[0] = t->ne[1] * t->ne[2] * t->ne[3];
+        d[1] = t->ne[0];
+        s[0] = d[1];
+        s[1] = 1;
+    };
+
+    int64_t self_d[2], self_s[2];
+    int64_t val_d[2],  val_s[2];
+    flat_2d(dst, self_d, self_s);
+    flat_2d(src, val_d,  val_s);
+
     topsatenTensor self_t(topsatenSize_t(self_d, 2), topsatenSize_t(self_s, 2),
                           ggml_to_topsaten_dtype(dst->type), dst->data);
 
-    // value: src, also [r, n] PyTorch.
-    int64_t val_d[2] = { src->ne[1], src->ne[0] };
-    int64_t val_s[2] = { (int64_t) (src->nb[1] / ggml_type_size(src->type)),
-                         (int64_t) (src->nb[0] / ggml_type_size(src->type)) };
-    topsatenTensor val_t(topsatenSize_t(val_d, 2), topsatenSize_t(val_s, 2),
-                         ggml_to_topsaten_dtype(src->type), src->data);
+    // If src and dst differ in dtype, cast src into a scratch buffer in
+    // dst's dtype before IndexPut.
+    void *  cast_buf       = nullptr;
+    size_t  cast_bytes     = 0;
+    void *  src_data       = src->data;
+    topsatenDataType_t src_dtype_topsaten = ggml_to_topsaten_dtype(src->type);
+    if (src->type != dst->type) {
+        const int64_t n_elem = val_d[0] * val_d[1];
+        cast_bytes = (size_t) n_elem * ggml_type_size(dst->type);
+        cast_buf   = ctx->pool.alloc(cast_bytes);
 
-    // idx: 1D [r]. Map to topsaten dtype (I32 or I64).
+        topsatenTensor src_view(topsatenSize_t(val_d, 2), topsatenSize_t(val_s, 2),
+                                src_dtype_topsaten, src->data);
+        topsatenTensor cast_view(topsatenSize_t(val_d, 2), topsatenSize_t(val_s, 2),
+                                 ggml_to_topsaten_dtype(dst->type), cast_buf);
+        topsatenDataType_t target = ggml_to_topsaten_dtype(dst->type);
+        TOPSATEN_CHECK(topsatenTo(cast_view, src_view, target,
+                                  /*non_blocking=*/false, /*copy=*/true,
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->stream));
+        src_data           = cast_buf;
+        src_dtype_topsaten = target;
+    }
+
+    topsatenTensor val_t(topsatenSize_t(val_d, 2), topsatenSize_t(val_s, 2),
+                         src_dtype_topsaten, src_data);
+
     int64_t idx_d[1] = { idx->ne[0] };
     int64_t idx_s[1] = { 1 };
     topsatenDataType_t idx_dtype = (idx->type == GGML_TYPE_I64) ? TOPSATEN_DATA_I64
@@ -726,6 +758,11 @@ static bool gcu_op_set_rows(ggml_backend_gcu_context * ctx, ggml_tensor * node) 
 
     std::vector<topsatenTensor> indices = { idx_t };
     TOPSATEN_CHECK(topsatenIndexPut(self_t, indices, val_t, /*accumulate=*/false, ctx->stream));
+
+    if (cast_buf) {
+        TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+        ctx->pool.free(cast_buf, cast_bytes);
+    }
     return true;
 }
 
@@ -932,15 +969,15 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             const ggml_tensor * idx = op->src[1];
             const ggml_tensor * dst = op->src[2];
             if (!src || !idx || !dst) return false;
-            // ggml KV cache writes use I64 indices; topsatenIndexPut accepts
-            // both i32 and i64 per its docs.
             if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) return false;
             if (!gcu_dtype_supported(src->type) || !gcu_dtype_supported(dst->type)) return false;
-            if (src->type != dst->type) return false;
-            if (src->ne[2] != 1 || src->ne[3] != 1) return false;
-            if (dst->ne[2] != 1 || dst->ne[3] != 1) return false;
+            // F32->F16 / F16->F32 are common (KV cache is F16 but compute
+            // produces F32 vectors). gcu_op_set_rows casts via scratch.
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) return false;
+            if (src->ne[0] != dst->ne[0]) return false;
             if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) return false;
             if (!ggml_is_contiguous(idx)) return false;
+            if (src->ne[1] * src->ne[2] * src->ne[3] != idx->ne[0]) return false;
             return true;
         }
         case GGML_OP_CPY:
