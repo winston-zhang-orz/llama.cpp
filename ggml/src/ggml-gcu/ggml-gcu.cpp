@@ -971,8 +971,13 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!src || !idx || !dst) return false;
             if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) return false;
             if (!gcu_dtype_supported(src->type) || !gcu_dtype_supported(dst->type)) return false;
-            // F32->F16 / F16->F32 are common (KV cache is F16 but compute
-            // produces F32 vectors). gcu_op_set_rows casts via scratch.
+            // MVP-2 explicit decision: F16 destination is the KV cache, and
+            // topsatenIndexPut returns NOT_SUPPORT at runtime for the cache
+            // shape on this SDK. Refuse F16 dst here so the scheduler routes
+            // those writes to CPU (and the cache buffer itself ends up CPU-
+            // resident). F32 dst stays accepted; same-dtype only.
+            if (dst->type != GGML_TYPE_F32) return false;
+            if (src->type != dst->type) return false;
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) return false;
             if (src->ne[0] != dst->ne[0]) return false;
             if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) return false;
