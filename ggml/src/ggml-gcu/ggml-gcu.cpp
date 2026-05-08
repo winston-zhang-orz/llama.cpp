@@ -811,6 +811,59 @@ static bool gcu_op_get_rows(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// SOFT_MAX. out = softmax(scale * x + mask, dim=-1). max_bias must be 0.
+// Plan: scale x into a scratch slab (mul by scalar), optionally add mask,
+// then topsatenSoftmaxForward along the last PyTorch dim (= ggml ne[0]).
+static bool gcu_op_soft_max(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * x    = dst->src[0];
+    ggml_tensor * mask = dst->src[1];   // may be nullptr
+    float scale, max_bias;
+    memcpy(&scale,    (const float *)dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *)dst->op_params + 1, sizeof(float));
+    GGML_ASSERT(max_bias == 0.0f);
+
+    const size_t bytes = ggml_nbytes(dst);
+    void * scratch = ctx->pool.alloc(bytes);
+
+    // Build a topsatenTensor view over scratch with dst's shape/strides.
+    gcu_tensor_dims d_dst, d_x, d_mask;
+    topsatenTensor out_t = make_topsaten_tensor(dst, d_dst);
+    topsatenTensor x_t   = make_topsaten_tensor(x,   d_x);
+    topsatenTensor scratch_t;
+    {
+        const size_t bpe = ggml_type_size(dst->type);
+        int rank = ggml_n_dims(dst); if (rank < 1) rank = 1;
+        for (int i = 0; i < rank; i++) {
+            d_dst.dims[i] = dst->ne[rank - 1 - i];
+            d_dst.strs[i] = dst->nb[rank - 1 - i] / (int64_t) bpe;
+        }
+        scratch_t = topsatenTensor(topsatenSize_t(d_dst.dims, rank),
+                                   topsatenSize_t(d_dst.strs, rank),
+                                   ggml_to_topsaten_dtype(dst->type), scratch);
+    }
+
+    // scratch = x * scale
+    {
+        topsatenScalar_t s; s.dtype = TOPSATEN_DATA_FP32; s.fval = scale;
+        TOPSATEN_CHECK(topsatenMul(scratch_t, x_t, s, ctx->stream));
+    }
+
+    // scratch += mask (with alpha=1)
+    if (mask) {
+        topsatenTensor mask_t = make_topsaten_tensor(mask, d_mask);
+        topsatenScalar_t alpha; alpha.dtype = TOPSATEN_DATA_FP32; alpha.fval = 1.0;
+        TOPSATEN_CHECK(topsatenAdd(scratch_t, scratch_t, mask_t, alpha, ctx->stream));
+    }
+
+    // out = softmax(scratch, dim=last)
+    int rank = ggml_n_dims(dst); if (rank < 1) rank = 1;
+    TOPSATEN_CHECK(topsatenSoftmaxForward(out_t, scratch_t, rank - 1, ctx->stream));
+
+    TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+    ctx->pool.free(scratch, bytes);
+    return true;
+}
+
 // SILU. y = x * sigmoid(x). Same dtype in/out, contiguous.
 static bool gcu_op_silu(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     ggml_tensor * src = dst->src[0];
@@ -844,6 +897,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_cpy(ctx, node);
         case GGML_OP_MUL_MAT:
             return gcu_op_mul_mat(ctx, node);
+        case GGML_OP_SOFT_MAX:
+            return gcu_op_soft_max(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -1052,6 +1107,17 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (uop != GGML_UNARY_OP_SILU) return false;
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
+            if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_SOFT_MAX: {
+            float max_bias;
+            memcpy(&max_bias, (const float *)op->op_params + 1, sizeof(float));
+            if (max_bias != 0.0f) return false;
+            if (op->src[2] != nullptr) return false;   // softmax sinks: MVP-3
+            if (!gcu_dtype_supported(op->src[0]->type)) return false;
+            if (op->src[0]->type != op->type) return false;
+            if (op->src[1] && !gcu_dtype_supported(op->src[1]->type)) return false;
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
             return true;
         }
