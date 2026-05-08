@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 // === Backend GUID ===================================================
 
@@ -88,6 +90,73 @@ static void gcu_global_init_dec() {
     }
 }
 
+// === LIFO size-keyed pool allocator =================================
+
+// Recurring intermediate-tensor allocations during a forward pass have a
+// small set of distinct sizes. Cache freed slabs by rounded size so we
+// avoid topsMalloc/topsFree on the hot path. Cap the cache at 4 GiB to
+// bound retained device memory.
+
+class gcu_pool {
+public:
+    explicit gcu_pool(int32_t device, size_t cap_bytes = (size_t) 4 << 30)
+        : device_(device), cap_(cap_bytes) {}
+
+    ~gcu_pool() { drain(); }
+
+    void * alloc(size_t size) {
+        size_t key = round_up(size);
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = free_lists_.find(key);
+        if (it != free_lists_.end() && !it->second.empty()) {
+            void * p = it->second.back();
+            it->second.pop_back();
+            cached_bytes_ -= key;
+            return p;
+        }
+        void * p = nullptr;
+        TOPS_CHECK(topsSetDevice(device_));
+        TOPS_CHECK(topsMalloc(&p, key));
+        return p;
+    }
+
+    void free(void * p, size_t size) {
+        if (!p) return;
+        size_t key = round_up(size);
+        std::lock_guard<std::mutex> lk(mu_);
+        if (cached_bytes_ + key > cap_) {
+            TOPS_CHECK(topsSetDevice(device_));
+            TOPS_CHECK(topsFree(p));
+            return;
+        }
+        free_lists_[key].push_back(p);
+        cached_bytes_ += key;
+    }
+
+private:
+    static size_t round_up(size_t n) {
+        constexpr size_t G = 256;
+        return (n + G - 1) & ~(G - 1);
+    }
+    void drain() {
+        std::lock_guard<std::mutex> lk(mu_);
+        TOPS_CHECK(topsSetDevice(device_));
+        for (auto & kv : free_lists_) {
+            for (void * p : kv.second) {
+                TOPS_CHECK(topsFree(p));
+            }
+        }
+        free_lists_.clear();
+        cached_bytes_ = 0;
+    }
+
+    int32_t device_;
+    size_t  cap_;
+    size_t  cached_bytes_ = 0;
+    std::unordered_map<size_t, std::vector<void*>> free_lists_;
+    std::mutex mu_;
+};
+
 // === Per-context state ==============================================
 
 #define GGML_GCU_NAME_MAX 64
@@ -97,8 +166,9 @@ struct ggml_backend_gcu_context {
     std::string  name;          // "GCU0", "GCU1", ...
     std::string  description;   // populated from topsGetDeviceProperties
     topsStream_t stream        = nullptr;
+    gcu_pool     pool;          // declared after stream so it's destroyed first
 
-    explicit ggml_backend_gcu_context(int32_t dev) : device(dev) {
+    explicit ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
         TOPS_CHECK(topsSetDevice(device));
         gcu_global_init_inc();
         TOPS_CHECK(topsStreamCreate(&stream));
