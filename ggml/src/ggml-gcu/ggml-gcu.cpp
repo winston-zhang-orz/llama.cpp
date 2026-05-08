@@ -20,6 +20,7 @@
 using namespace topsaten;
 using namespace topsvllm;
 
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -903,6 +904,124 @@ static bool gcu_op_get_rows(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// Builds an interleaved [max_pos, n_dims] cos/sin table per topsvllm
+// convention: row p contains cos values for theta_i*p in the first n_dims/2
+// slots followed by sin values in the next n_dims/2 slots.
+//
+// theta_i = freq_base^(-2i / n_dims) * freq_scale
+static void gcu_build_rope_cos_sin_host(int n_dims, int max_pos,
+                                        float freq_base, float freq_scale,
+                                        std::vector<float> & out) {
+    const int half = n_dims / 2;
+    out.assign((size_t) max_pos * (size_t) n_dims, 0.0f);
+    for (int p = 0; p < max_pos; p++) {
+        float * row = out.data() + (size_t) p * n_dims;
+        for (int i = 0; i < half; i++) {
+            const float theta = std::pow(freq_base, -2.0f * (float) i / (float) n_dims) * freq_scale;
+            const float angle = (float) p * theta;
+            row[i]        = std::cos(angle);
+            row[i + half] = std::sin(angle);
+        }
+    }
+}
+
+// ROPE. ggml mode 0 only.
+//
+// Inputs: x [head_dim, n_heads, n_tokens, 1] F32/F16; pos [n_tokens] I32.
+// Maps to topsvllmRotaryEmbedding(query, key, positions, cos_sin_cache,
+//   head_size, is_neox=false, stream).
+// We treat x as the query; pass a small zero-filled scratch as key
+// (topsvllm rotates both; we ignore the dummy key result).
+// Positions get cast to I64 on host. cos_sin table is precomputed on host
+// per call.
+//
+// In-place: ggml_rope returns a view of `a`, so dst->data == x->data already.
+static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * x   = dst->src[0];
+    ggml_tensor * pos = dst->src[1];
+
+    const int32_t n_dims = ((const int32_t *) dst->op_params)[1];
+    float freq_base, freq_scale;
+    memcpy(&freq_base,  (const int32_t *) dst->op_params + 5, sizeof(float));
+    memcpy(&freq_scale, (const int32_t *) dst->op_params + 6, sizeof(float));
+
+    const int64_t head_dim = x->ne[0];
+    const int64_t n_heads  = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+    GGML_ASSERT(n_dims <= head_dim);
+    GGML_ASSERT(pos->ne[0] == n_tokens);
+
+    // Read positions to host so we can determine max_pos and cast to I64.
+    std::vector<int32_t> pos_host(n_tokens);
+    TOPS_CHECK(topsMemcpy(pos_host.data(), pos->data,
+                          (size_t) n_tokens * sizeof(int32_t),
+                          topsMemcpyDeviceToHost));
+
+    int max_pos = 0;
+    for (int32_t p : pos_host) max_pos = std::max(max_pos, (int) p);
+    max_pos += 1;
+
+    std::vector<float> cs_host;
+    gcu_build_rope_cos_sin_host(n_dims, max_pos, freq_base, freq_scale, cs_host);
+
+    const size_t cs_bytes  = cs_host.size() * sizeof(float);
+    const size_t pos_bytes = (size_t) n_tokens * sizeof(int64_t);
+    void * cs_dev  = ctx->pool.alloc(cs_bytes);
+    void * pos_dev = ctx->pool.alloc(pos_bytes);
+
+    TOPS_CHECK(topsMemcpyAsync(cs_dev, cs_host.data(), cs_bytes,
+                               topsMemcpyHostToDevice, ctx->stream));
+    std::vector<int64_t> pos_i64(n_tokens);
+    for (int64_t i = 0; i < n_tokens; i++) pos_i64[i] = (int64_t) pos_host[i];
+    TOPS_CHECK(topsMemcpyAsync(pos_dev, pos_i64.data(), pos_bytes,
+                               topsMemcpyHostToDevice, ctx->stream));
+
+    // topsvllmRotaryEmbedding rotates query in-place. For ggml's non-inplace
+    // ROPE (dst is a fresh tensor distinct from x), copy x into dst first so
+    // we can rotate dst safely without touching x.
+    if (dst->data != x->data) {
+        TOPS_CHECK(topsMemcpyAsync(dst->data, x->data, ggml_nbytes(x),
+                                   topsMemcpyDeviceToDevice, ctx->stream));
+    }
+
+    // Dummy key tensor — small, zero, just to satisfy topsvllmRotaryEmbedding's
+    // dual-tensor signature. Shape [n_tokens, head_dim].
+    const size_t dummy_bytes = (size_t) n_tokens * head_dim * ggml_type_size(x->type);
+    void * dummy_key_dev = ctx->pool.alloc(dummy_bytes);
+    TOPS_CHECK(topsMemsetAsync(dummy_key_dev, 0, dummy_bytes, ctx->stream));
+
+    // query: [n_tokens, n_heads * head_dim] over dst's memory (rotated in place).
+    int64_t q_d[2] = { n_tokens, n_heads * head_dim };
+    int64_t q_s[2] = { (int64_t)(dst->nb[2] / ggml_type_size(dst->type)), 1 };
+    topsatenTensor q_tt(topsatenSize_t(q_d, 2), topsatenSize_t(q_s, 2),
+                        ggml_to_topsaten_dtype(dst->type), dst->data);
+
+    int64_t k_d[2] = { n_tokens, head_dim };
+    int64_t k_s[2] = { head_dim, 1 };
+    topsatenTensor k_tt(topsatenSize_t(k_d, 2), topsatenSize_t(k_s, 2),
+                        ggml_to_topsaten_dtype(x->type), dummy_key_dev);
+
+    int64_t pos_d[1] = { n_tokens };
+    int64_t pos_s[1] = { 1 };
+    topsatenTensor pos_tt(topsatenSize_t(pos_d, 1), topsatenSize_t(pos_s, 1),
+                          TOPSATEN_DATA_I64, pos_dev);
+
+    int64_t cs_d[2] = { max_pos, n_dims };
+    int64_t cs_s[2] = { n_dims, 1 };
+    topsatenTensor cs_tt(topsatenSize_t(cs_d, 2), topsatenSize_t(cs_s, 2),
+                         TOPSATEN_DATA_FP32, cs_dev);
+
+    TOPSATEN_CHECK(topsvllmRotaryEmbedding(q_tt, k_tt, pos_tt, cs_tt,
+                                           (int) head_dim, /*is_neox=*/false,
+                                           ctx->stream));
+
+    TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+    ctx->pool.free(cs_dev,        cs_bytes);
+    ctx->pool.free(pos_dev,       pos_bytes);
+    ctx->pool.free(dummy_key_dev, dummy_bytes);
+    return true;
+}
+
 // SOFT_MAX. out = softmax(scale * x + mask, dim=-1). max_bias must be 0.
 // Plan: scale x into a scratch slab (mul by scalar), optionally add mask,
 // then topsatenSoftmaxForward along the last PyTorch dim (= ggml ne[0]).
@@ -993,6 +1112,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_soft_max(ctx, node);
         case GGML_OP_RMS_NORM:
             return gcu_op_rms_norm(ctx, node);
+        case GGML_OP_ROPE:
+            return gcu_op_rope(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -1208,6 +1329,23 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_ROPE: {
+            // MVP-2: F32 only. F16 inputs produce NaN with our F32 cos/sin
+            // table on this SDK version; revisit in MVP-3 with matched dtypes.
+            if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+            if (!op->src[1] || op->src[1]->type != GGML_TYPE_I32) return false;
+            const int32_t mode = ((const int32_t *) op->op_params)[2];
+            float ext_factor, attn_factor;
+            memcpy(&ext_factor,  (const int32_t *) op->op_params + 7, sizeof(float));
+            memcpy(&attn_factor, (const int32_t *) op->op_params + 8, sizeof(float));
+            if (mode != 0) return false;
+            if (ext_factor != 0.0f) return false;
+            if (attn_factor != 0.0f && attn_factor != 1.0f) return false;
+            if (op->src[2]) return false;            // freq factors (yarn) not supported
+            if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
+            if (op->src[0]->ne[3] != 1) return false;
             return true;
         }
         case GGML_OP_SOFT_MAX: {
