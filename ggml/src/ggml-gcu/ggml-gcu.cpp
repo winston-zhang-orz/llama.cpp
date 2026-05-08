@@ -1006,6 +1006,19 @@ ggml_backend_t ggml_backend_gcu_init(int32_t device) {
         return nullptr;
     }
 
+    // Locate the matching ggml_backend_dev_t in the registry so that
+    // backend->device is populated even when callers invoke this function
+    // directly (e.g., the smoke test) instead of going through the device
+    // interface's init_backend.
+    ggml_backend_reg_t reg     = ggml_backend_gcu_reg();
+    ggml_backend_dev_t dev_ptr = nullptr;
+    size_t n_dev = ggml_backend_reg_dev_count(reg);
+    for (size_t i = 0; i < n_dev; i++) {
+        ggml_backend_dev_t d = ggml_backend_reg_dev_get(reg, i);
+        auto * dctx = (ggml_backend_gcu_device_context *) d->context;
+        if (dctx->device == device) { dev_ptr = d; break; }
+    }
+
     // Use the device's shared context. Sharing means buffer copies and
     // graph_compute use the same stream, so set_tensor / get_tensor
     // ordering is correct without extra event coordination.
@@ -1014,7 +1027,7 @@ ggml_backend_t ggml_backend_gcu_init(int32_t device) {
     auto * backend = new ggml_backend{
         /* .guid    = */ ggml_backend_gcu_guid(),
         /* .iface   = */ ggml_backend_gcu_i,
-        /* .device  = */ nullptr,    // patched by device.init_backend
+        /* .device  = */ dev_ptr,
         /* .context = */ ctx,
     };
     return backend;
