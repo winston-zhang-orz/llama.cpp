@@ -595,6 +595,18 @@ static bool gcu_op_scale(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// MVP-1: CPY/DUP/CONT support same-dtype contiguous moves via topsMemcpy.
+// Dtype-converting / non-contiguous copies are refused upstream.
+static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(src->type == dst->type);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nbytes(src) == ggml_nbytes(dst));
+    TOPS_CHECK(topsMemcpyAsync(dst->data, src->data, ggml_nbytes(src),
+                               topsMemcpyDeviceToDevice, ctx->stream));
+    return true;
+}
+
 // MVP-1: GET_ROWS handles only the unbatched case (in is effectively 2D
 // [n, m], idx is 1D [r]). Batched GET_ROWS (be1>1 or be2>1) goes to CPU.
 static bool gcu_op_get_rows(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
@@ -642,6 +654,10 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_scale(ctx, node);
         case GGML_OP_GET_ROWS:
             return gcu_op_get_rows(ctx, node);
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+        case GGML_OP_CONT:
+            return gcu_op_cpy(ctx, node);
         default:
             return false;
     }
@@ -783,6 +799,17 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (in->ne[2] != 1 || in->ne[3] != 1) return false;
             if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) return false;
             if (!ggml_is_contiguous(idx)) return false;
+            return true;
+        }
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+        case GGML_OP_CONT: {
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            // MVP-1: same-dtype contiguous copies only.
+            if (src->type != op->type) return false;
+            if (!gcu_dtype_supported(src->type) || !gcu_dtype_supported(op->type)) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
             return true;
         }
         default:
