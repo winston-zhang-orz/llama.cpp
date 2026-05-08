@@ -355,6 +355,148 @@ static const ggml_backend_i ggml_backend_gcu_i = {
     /* .graph_optimize       = */ nullptr,
 };
 
+// === Device interface ================================================
+
+#include <memory>
+
+struct ggml_backend_gcu_device_context {
+    int32_t      device;
+    std::string  name;
+    std::string  description;
+
+    // Lazily-built (one per process per device).
+    std::unique_ptr<ggml_backend_gcu_context>             ctx;
+    std::unique_ptr<ggml_backend_buffer_type>             buft;
+    std::unique_ptr<ggml_backend_gcu_buffer_type_context> buft_ctx;
+    std::mutex   mu;
+
+    ggml_backend_gcu_context * get_ctx() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!ctx) {
+            ctx.reset(new ggml_backend_gcu_context(device));
+        }
+        return ctx.get();
+    }
+
+    ggml_backend_buffer_type_t get_buft() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!buft) {
+            // Construct ctx (without re-locking) by inlining.
+            if (!ctx) {
+                ctx.reset(new ggml_backend_gcu_context(device));
+            }
+            buft_ctx.reset(new ggml_backend_gcu_buffer_type_context{ ctx.get() });
+            buft.reset(new ggml_backend_buffer_type{
+                /* .iface   = */ ggml_backend_gcu_buffer_type_i,
+                /* .device  = */ nullptr,    // patched by get_buffer_type below
+                /* .context = */ buft_ctx.get(),
+            });
+        }
+        return buft.get();
+    }
+};
+
+static const char * ggml_backend_gcu_device_get_name(ggml_backend_dev_t dev) {
+    auto * d = (ggml_backend_gcu_device_context *) dev->context;
+    return d->name.c_str();
+}
+
+static const char * ggml_backend_gcu_device_get_description(ggml_backend_dev_t dev) {
+    auto * d = (ggml_backend_gcu_device_context *) dev->context;
+    return d->description.c_str();
+}
+
+static void ggml_backend_gcu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    auto * d = (ggml_backend_gcu_device_context *) dev->context;
+    ggml_backend_gcu_get_device_memory(d->device, free, total);
+}
+
+static enum ggml_backend_dev_type ggml_backend_gcu_device_get_type(ggml_backend_dev_t /*dev*/) {
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_gcu_device_get_buffer_type(ggml_backend_dev_t dev) {
+    auto * d = (ggml_backend_gcu_device_context *) dev->context;
+    auto * buft = d->get_buft();
+    if (buft) buft->device = dev;
+    return buft;
+}
+
+static void ggml_backend_gcu_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    props->name        = ggml_backend_gcu_device_get_name(dev);
+    props->description = ggml_backend_gcu_device_get_description(dev);
+    props->type        = ggml_backend_gcu_device_get_type(dev);
+    ggml_backend_gcu_device_get_memory(dev, &props->memory_free, &props->memory_total);
+    props->device_id   = nullptr;
+    props->caps = {
+        /* .async                = */ false,
+        /* .host_buffer          = */ false,
+        /* .buffer_from_host_ptr = */ false,
+        /* .events               = */ false,
+    };
+}
+
+static ggml_backend_t ggml_backend_gcu_device_init_backend(ggml_backend_dev_t dev, const char * /*params*/) {
+    auto * d = (ggml_backend_gcu_device_context *) dev->context;
+    ggml_backend_t b = ggml_backend_gcu_init(d->device);
+    if (b) b->device = dev;
+    return b;
+}
+
+static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, const ggml_tensor * /*op*/) {
+    return false;   // filled in starting Phase E
+}
+
+static bool ggml_backend_gcu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    return buft == ggml_backend_gcu_device_get_buffer_type(dev);
+}
+
+static const ggml_backend_device_i ggml_backend_gcu_device_i = {
+    /* .get_name              = */ ggml_backend_gcu_device_get_name,
+    /* .get_description       = */ ggml_backend_gcu_device_get_description,
+    /* .get_memory            = */ ggml_backend_gcu_device_get_memory,
+    /* .get_type              = */ ggml_backend_gcu_device_get_type,
+    /* .get_props             = */ ggml_backend_gcu_device_get_props,
+    /* .init_backend          = */ ggml_backend_gcu_device_init_backend,
+    /* .get_buffer_type       = */ ggml_backend_gcu_device_get_buffer_type,
+    /* .get_host_buffer_type  = */ nullptr,
+    /* .buffer_from_host_ptr  = */ nullptr,
+    /* .supports_op           = */ ggml_backend_gcu_device_supports_op,
+    /* .supports_buft         = */ ggml_backend_gcu_device_supports_buft,
+    /* .offload_op            = */ nullptr,
+    /* .event_new             = */ nullptr,
+    /* .event_free            = */ nullptr,
+    /* .event_synchronize     = */ nullptr,
+};
+
+// === Registry =========================================================
+
+struct ggml_backend_gcu_reg_context {
+    std::vector<std::unique_ptr<ggml_backend_gcu_device_context>> dev_ctxs;
+    std::vector<std::unique_ptr<ggml_backend_device>>             devs;
+};
+
+static const char * ggml_backend_gcu_reg_get_name(ggml_backend_reg_t /*reg*/) {
+    return GGML_GCU_NAME;
+}
+
+static size_t ggml_backend_gcu_reg_get_device_count(ggml_backend_reg_t reg) {
+    auto * rctx = (ggml_backend_gcu_reg_context *) reg->context;
+    return rctx->devs.size();
+}
+
+static ggml_backend_dev_t ggml_backend_gcu_reg_get_device(ggml_backend_reg_t reg, size_t idx) {
+    auto * rctx = (ggml_backend_gcu_reg_context *) reg->context;
+    return rctx->devs[idx].get();
+}
+
+static const ggml_backend_reg_i ggml_backend_gcu_reg_i = {
+    /* .get_name         = */ ggml_backend_gcu_reg_get_name,
+    /* .get_device_count = */ ggml_backend_gcu_reg_get_device_count,
+    /* .get_device       = */ ggml_backend_gcu_reg_get_device,
+    /* .get_proc_address = */ nullptr,
+};
+
 // === Stubs (filled in subsequent phases) =============================
 
 extern "C" {
@@ -405,7 +547,44 @@ ggml_backend_t ggml_backend_gcu_init(int32_t device) {
 }
 
 ggml_backend_reg_t ggml_backend_gcu_reg(void) {
-    return nullptr;
+    static ggml_backend_reg              s_reg{};
+    static ggml_backend_gcu_reg_context  s_rctx{};
+    static std::once_flag                once;
+
+    std::call_once(once, [] {
+        int n = ggml_backend_gcu_get_device_count();
+        for (int i = 0; i < n; i++) {
+            char name_buf[GGML_GCU_NAME_MAX];
+            snprintf(name_buf, sizeof(name_buf), "GCU%d", i);
+
+            std::string desc = "Enflame GCU";
+            topsDeviceProp_t prop{};
+            if (topsGetDeviceProperties(&prop, i) == topsSuccess) {
+                desc = prop.name;
+            }
+
+            auto dctx = std::unique_ptr<ggml_backend_gcu_device_context>(
+                new ggml_backend_gcu_device_context());
+            dctx->device      = i;
+            dctx->name        = name_buf;
+            dctx->description = desc;
+
+            auto dev = std::unique_ptr<ggml_backend_device>(new ggml_backend_device{
+                /* .iface   = */ ggml_backend_gcu_device_i,
+                /* .reg     = */ &s_reg,
+                /* .context = */ dctx.get(),
+            });
+            s_rctx.devs.push_back(std::move(dev));
+            s_rctx.dev_ctxs.push_back(std::move(dctx));
+        }
+
+        s_reg = ggml_backend_reg{
+            /* .api_version = */ GGML_BACKEND_API_VERSION,
+            /* .iface       = */ ggml_backend_gcu_reg_i,
+            /* .context     = */ &s_rctx,
+        };
+    });
+    return &s_reg;
 }
 
 } // extern "C"
