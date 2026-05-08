@@ -673,15 +673,28 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
-// MVP-1: CPY/DUP/CONT support same-dtype contiguous moves via topsMemcpy.
-// Dtype-converting / non-contiguous copies are refused upstream.
+// CPY/DUP/CONT. Same dtype + contiguous → fast topsMemcpyAsync(D2D).
+// Different dtype (F32↔F16, both contiguous) → topsatenTo cast.
 static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     ggml_tensor * src = dst->src[0];
-    GGML_ASSERT(src->type == dst->type);
     GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
-    GGML_ASSERT(ggml_nbytes(src) == ggml_nbytes(dst));
-    TOPS_CHECK(topsMemcpyAsync(dst->data, src->data, ggml_nbytes(src),
-                               topsMemcpyDeviceToDevice, ctx->stream));
+
+    if (src->type == dst->type) {
+        GGML_ASSERT(ggml_nbytes(src) == ggml_nbytes(dst));
+        TOPS_CHECK(topsMemcpyAsync(dst->data, src->data, ggml_nbytes(src),
+                                   topsMemcpyDeviceToDevice, ctx->stream));
+        return true;
+    }
+
+    // dtype-converting path (F32 ↔ F16). Same shape, same nelements.
+    GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
+    gcu_tensor_dims dout, din;
+    topsatenTensor out_t = make_topsaten_tensor(dst, dout);
+    topsatenTensor in_t  = make_topsaten_tensor(src, din);
+    topsatenDataType_t target = ggml_to_topsaten_dtype(dst->type);
+    TOPSATEN_CHECK(topsatenTo(out_t, in_t, target,
+                              /*non_blocking=*/false, /*copy=*/true,
+                              TOPSATEN_MEMORY_CONTIGUOUS, ctx->stream));
     return true;
 }
 
@@ -990,10 +1003,14 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
         case GGML_OP_CONT: {
             const ggml_tensor * src = op->src[0];
             if (!src) return false;
-            // MVP-1: same-dtype contiguous copies only.
-            if (src->type != op->type) return false;
             if (!gcu_dtype_supported(src->type) || !gcu_dtype_supported(op->type)) return false;
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            // Same dtype OR F32↔F16 dtype conversion via topsatenTo.
+            if (src->type != op->type) {
+                bool ok = (src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16) ||
+                          (src->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32);
+                if (!ok) return false;
+            }
             return true;
         }
         case GGML_OP_MUL_MAT: {
