@@ -13,6 +13,7 @@
 #include <tops/tops_runtime.h>
 
 #include <cstdio>
+#include <mutex>
 
 // === Error handling =================================================
 
@@ -53,6 +54,29 @@ static const char * topsaten_status_to_str(topsatenStatus_t s) {
                            topsaten_status_to_str(s__));                            \
         }                                                                           \
     } while (0)
+
+// === Process-level topsaten init refcount ===========================
+//
+// topsatenInit / topsatenFinalize are documented as process-global. Wrap
+// with a mutex+counter so multiple ggml_backend_gcu contexts (one per
+// device) bracket lifetime correctly without re-init.
+
+static std::mutex g_init_mu;
+static int        g_init_refcount = 0;
+
+static void gcu_global_init_inc() {
+    std::lock_guard<std::mutex> lk(g_init_mu);
+    if (g_init_refcount++ == 0) {
+        TOPSATEN_CHECK(topsatenInit());
+    }
+}
+
+static void gcu_global_init_dec() {
+    std::lock_guard<std::mutex> lk(g_init_mu);
+    if (--g_init_refcount == 0) {
+        TOPSATEN_CHECK(topsatenFinalize());
+    }
+}
 
 // === Stubs (filled in subsequent phases) =============================
 
