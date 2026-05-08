@@ -16,6 +16,15 @@
 #include <mutex>
 #include <string>
 
+// === Backend GUID ===================================================
+
+static ggml_guid_t ggml_backend_gcu_guid() {
+    // Stable 16-byte UUID — generated once for this backend; never changes.
+    static ggml_guid guid = { 0x9e, 0x3f, 0x12, 0xa4, 0x77, 0x88, 0x4b, 0xc1,
+                              0x90, 0x2d, 0xe5, 0x06, 0xf4, 0x18, 0x21, 0x33 };
+    return &guid;
+}
+
 // === Error handling =================================================
 
 [[noreturn]]
@@ -187,8 +196,9 @@ void ggml_backend_gcu_get_device_memory(int32_t device, size_t * free, size_t * 
     TOPS_CHECK(topsSetDevice(prev));
 }
 
-bool ggml_backend_is_gcu(ggml_backend_t /*backend*/) {
-    return false;   // patched in B5 once we have a GUID
+bool ggml_backend_is_gcu(ggml_backend_t backend) {
+    return backend != nullptr &&
+           ggml_guid_matches(backend->guid, ggml_backend_gcu_guid());
 }
 
 ggml_backend_t ggml_backend_gcu_init(int32_t device) {
@@ -200,7 +210,7 @@ ggml_backend_t ggml_backend_gcu_init(int32_t device) {
     auto * ctx = new ggml_backend_gcu_context(device);
 
     auto * backend = new ggml_backend{
-        /* .guid    = */ nullptr,         // filled in B5
+        /* .guid    = */ ggml_backend_gcu_guid(),
         /* .iface   = */ ggml_backend_gcu_i,
         /* .device  = */ nullptr,         // filled in by device.init_backend (Phase C)
         /* .context = */ ctx,
