@@ -685,6 +685,50 @@ static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// SET_ROWS: dst[idx[i]] = src[i].
+//
+// ggml's ggml_set_rows packs args unusually: result is a view of `a`
+// (destination), and the node's slots are:
+//   src[0] = b   (source rows)
+//   src[1] = c   (row indices, I32)
+//   src[2] = a   (destination — written in place via the view)
+// See ggml.c around ggml_set_rows for the legacy ordering.
+//
+// Maps to topsatenIndexPut(self=dst, indices=[idx], value=src, accumulate=false).
+// MVP scope: F32 dst/src (matches GET_ROWS), I32 indices, unbatched 2D dst,
+// 1D idx, no accumulate.
+static bool gcu_op_set_rows(ggml_backend_gcu_context * ctx, ggml_tensor * node) {
+    ggml_tensor * src = node->src[0];   // source rows
+    ggml_tensor * idx = node->src[1];   // row indices
+    ggml_tensor * dst = node->src[2];   // destination (also aliased by node)
+
+    // self: dst, treated as 2D [m, n] (PyTorch order).
+    int64_t self_d[2] = { dst->ne[1], dst->ne[0] };
+    int64_t self_s[2] = { (int64_t) (dst->nb[1] / ggml_type_size(dst->type)),
+                          (int64_t) (dst->nb[0] / ggml_type_size(dst->type)) };
+    topsatenTensor self_t(topsatenSize_t(self_d, 2), topsatenSize_t(self_s, 2),
+                          ggml_to_topsaten_dtype(dst->type), dst->data);
+
+    // value: src, also [r, n] PyTorch.
+    int64_t val_d[2] = { src->ne[1], src->ne[0] };
+    int64_t val_s[2] = { (int64_t) (src->nb[1] / ggml_type_size(src->type)),
+                         (int64_t) (src->nb[0] / ggml_type_size(src->type)) };
+    topsatenTensor val_t(topsatenSize_t(val_d, 2), topsatenSize_t(val_s, 2),
+                         ggml_to_topsaten_dtype(src->type), src->data);
+
+    // idx: 1D [r]. Map to topsaten dtype (I32 or I64).
+    int64_t idx_d[1] = { idx->ne[0] };
+    int64_t idx_s[1] = { 1 };
+    topsatenDataType_t idx_dtype = (idx->type == GGML_TYPE_I64) ? TOPSATEN_DATA_I64
+                                                                : TOPSATEN_DATA_I32;
+    topsatenTensor idx_t(topsatenSize_t(idx_d, 1), topsatenSize_t(idx_s, 1),
+                         idx_dtype, idx->data);
+
+    std::vector<topsatenTensor> indices = { idx_t };
+    TOPSATEN_CHECK(topsatenIndexPut(self_t, indices, val_t, /*accumulate=*/false, ctx->stream));
+    return true;
+}
+
 // MVP-1: GET_ROWS handles only the unbatched case (in is effectively 2D
 // [n, m], idx is 1D [r]). Batched GET_ROWS (be1>1 or be2>1) goes to CPU.
 static bool gcu_op_get_rows(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
@@ -732,6 +776,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_scale(ctx, node);
         case GGML_OP_GET_ROWS:
             return gcu_op_get_rows(ctx, node);
+        case GGML_OP_SET_ROWS:
+            return gcu_op_set_rows(ctx, node);
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
@@ -877,6 +923,22 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (in->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
             // Unbatched only (in is effectively 2D, idx is 1D, both contiguous).
             if (in->ne[2] != 1 || in->ne[3] != 1) return false;
+            if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) return false;
+            if (!ggml_is_contiguous(idx)) return false;
+            return true;
+        }
+        case GGML_OP_SET_ROWS: {
+            const ggml_tensor * src = op->src[0];
+            const ggml_tensor * idx = op->src[1];
+            const ggml_tensor * dst = op->src[2];
+            if (!src || !idx || !dst) return false;
+            // ggml KV cache writes use I64 indices; topsatenIndexPut accepts
+            // both i32 and i64 per its docs.
+            if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) return false;
+            if (!gcu_dtype_supported(src->type) || !gcu_dtype_supported(dst->type)) return false;
+            if (src->type != dst->type) return false;
+            if (src->ne[2] != 1 || src->ne[3] != 1) return false;
+            if (dst->ne[2] != 1 || dst->ne[3] != 1) return false;
             if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) return false;
             if (!ggml_is_contiguous(idx)) return false;
             return true;
