@@ -277,6 +277,43 @@ static const ggml_backend_buffer_i ggml_backend_gcu_buffer_i = {
     /* .reset           = */ nullptr,
 };
 
+// === Buffer type ====================================================
+
+struct ggml_backend_gcu_buffer_type_context {
+    ggml_backend_gcu_context * ctx;
+};
+
+static const char * ggml_backend_gcu_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    auto * btctx = (ggml_backend_gcu_buffer_type_context *) buft->context;
+    return btctx->ctx->name.c_str();
+}
+
+static ggml_backend_buffer_t ggml_backend_gcu_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    auto * btctx = (ggml_backend_gcu_buffer_type_context *) buft->context;
+    void * base  = btctx->ctx->pool.alloc(size);
+
+    auto * bctx = new ggml_backend_gcu_buffer_context{ btctx->ctx, base, size };
+    return ggml_backend_buffer_init(buft, ggml_backend_gcu_buffer_i, bctx, size);
+}
+
+static size_t ggml_backend_gcu_buffer_type_get_alignment(ggml_backend_buffer_type_t /*buft*/) {
+    return 256;
+}
+
+static size_t ggml_backend_gcu_buffer_type_get_max_size(ggml_backend_buffer_type_t /*buft*/) {
+    return SIZE_MAX;
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_gcu_buffer_type_i = {
+    /* .get_name        = */ ggml_backend_gcu_buffer_type_name,
+    /* .alloc_buffer    = */ ggml_backend_gcu_buffer_type_alloc_buffer,
+    /* .get_alignment   = */ ggml_backend_gcu_buffer_type_get_alignment,
+    /* .get_max_size    = */ ggml_backend_gcu_buffer_type_get_max_size,
+    /* .get_alloc_size  = */ nullptr,    // default = ggml_nbytes
+    /* .is_host         = */ nullptr,    // device buffer (not host-accessible)
+};
+
 // === ggml_backend_i (mostly stubs for now) ==========================
 
 static const char * ggml_backend_gcu_name(ggml_backend_t backend) {
