@@ -15,8 +15,10 @@
 // topsaten functions (Add, Mul, Linear, IndexSelect, Copy, To, ...) live in
 // the topsaten:: namespace. The types (topsatenTensor, topsatenScalar_t,
 // topsatenStatus_t, ...) are at global scope. Pull the namespace in for
-// readability since this whole file is a topsaten wrapper.
+// readability since this whole file is a topsaten wrapper. The vllm-style
+// op family (RmsNorm, RotaryEmbedding, ...) is in topsvllm::.
 using namespace topsaten;
+using namespace topsvllm;
 
 #include <cstdio>
 #include <mutex>
@@ -182,6 +184,12 @@ struct ggml_backend_gcu_context {
     void *  zero_bias       = nullptr;
     size_t  zero_bias_bytes = 0;
 
+    // Per-context F32 ones buffer used as the gamma argument to
+    // topsvllmRmsNorm (which requires a real weight tensor).
+    void *  ones_n0         = nullptr;
+    size_t  ones_n0_bytes   = 0;
+    int64_t ones_n0_count   = 0;
+
     explicit ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
         TOPS_CHECK(topsSetDevice(device));
         gcu_global_init_inc();
@@ -200,6 +208,12 @@ struct ggml_backend_gcu_context {
     }
 
     ~ggml_backend_gcu_context() {
+        if (ones_n0) {
+            pool.free(ones_n0, ones_n0_bytes);
+            ones_n0 = nullptr;
+            ones_n0_bytes = 0;
+            ones_n0_count = 0;
+        }
         if (zero_bias) {
             pool.free(zero_bias, zero_bias_bytes);
             zero_bias = nullptr;
@@ -623,6 +637,84 @@ static void * gcu_get_zero_bias(ggml_backend_gcu_context * ctx, size_t n_bytes) 
     return ctx->zero_bias;
 }
 
+// Returns a device pointer to a F32 ones buffer of at least `count` elements.
+// Grows on demand. Always F32; callers cast to other dtypes via topsatenTo.
+static void * gcu_get_ones_f32(ggml_backend_gcu_context * ctx, int64_t count) {
+    if (ctx->ones_n0_count >= count) return ctx->ones_n0;
+    if (ctx->ones_n0) {
+        ctx->pool.free(ctx->ones_n0, ctx->ones_n0_bytes);
+    }
+    const size_t bytes = (size_t) count * sizeof(float);
+    ctx->ones_n0       = ctx->pool.alloc(bytes);
+    ctx->ones_n0_bytes = bytes;
+    ctx->ones_n0_count = count;
+
+    // Materialize ones: zero the buffer, then add scalar 1.0 broadcast.
+    TOPS_CHECK(topsMemsetAsync(ctx->ones_n0, 0, bytes, ctx->stream));
+    int64_t dims[1] = { count };
+    int64_t strs[1] = { 1 };
+    topsatenTensor t(topsatenSize_t(dims, 1), topsatenSize_t(strs, 1),
+                     TOPSATEN_DATA_FP32, ctx->ones_n0);
+    topsatenScalar_t one_lhs; one_lhs.dtype = TOPSATEN_DATA_FP32; one_lhs.fval = 1.0;
+    topsatenScalar_t alpha;   alpha.dtype   = TOPSATEN_DATA_FP32; alpha.fval   = 1.0;
+    // t = 1.0 + 1.0 * t (where t is currently 0) → t becomes 1.0
+    TOPSATEN_CHECK(topsatenAdd(t, one_lhs, t, alpha, ctx->stream));
+    return ctx->ones_n0;
+}
+
+// RMS_NORM. ggml_rms_norm: dst = x / sqrt(mean(x^2) + eps). No fused weight
+// (the multiply happens via a downstream MUL op), but topsvllmRmsNorm
+// requires a gamma weight argument — we pass an ones tensor of size ne[0].
+static bool gcu_op_rms_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const int64_t hidden_size = src->ne[0];
+
+    // F32 ones buffer for gamma. If src is F16, cast to F16 first into a
+    // per-call scratch (small — at most a few KiB).
+    void * ones_f32 = gcu_get_ones_f32(ctx, hidden_size);
+    void * gamma_data = ones_f32;
+    size_t cast_bytes = 0;
+    void * cast_buf   = nullptr;
+    topsatenDataType_t gamma_dtype = TOPSATEN_DATA_FP32;
+    if (src->type == GGML_TYPE_F16) {
+        cast_bytes = (size_t) hidden_size * sizeof(uint16_t);
+        cast_buf   = ctx->pool.alloc(cast_bytes);
+        int64_t gd[1] = { hidden_size };
+        int64_t gs[1] = { 1 };
+        topsatenTensor f32_t(topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
+                             TOPSATEN_DATA_FP32, ones_f32);
+        topsatenTensor f16_t(topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
+                             TOPSATEN_DATA_FP16, cast_buf);
+        topsatenDataType_t target = TOPSATEN_DATA_FP16;
+        TOPSATEN_CHECK(topsatenTo(f16_t, f32_t, target, false, true,
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->stream));
+        gamma_data  = cast_buf;
+        gamma_dtype = TOPSATEN_DATA_FP16;
+    }
+
+    int64_t gamma_d[1] = { hidden_size };
+    int64_t gamma_s[1] = { 1 };
+    topsatenTensor gamma_t(topsatenSize_t(gamma_d, 1), topsatenSize_t(gamma_s, 1),
+                           gamma_dtype, gamma_data);
+
+    gcu_tensor_dims d_dst, d_src;
+    topsatenTensor out_t = make_topsaten_tensor(dst, d_dst);
+    topsatenTensor in_t  = make_topsaten_tensor(src, d_src);
+
+    topsatenScalar_t eps_s; eps_s.dtype = TOPSATEN_DATA_FP32; eps_s.fval = eps;
+
+    TOPSATEN_CHECK(topsvllmRmsNorm(out_t, in_t, gamma_t, eps_s, ctx->stream));
+
+    if (cast_buf) {
+        TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+        ctx->pool.free(cast_buf, cast_bytes);
+    }
+    return true;
+}
+
 // MUL_MAT.
 //
 // ggml's MUL_MAT semantics: dst = src[0]^T @ src[1]
@@ -899,6 +991,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_mul_mat(ctx, node);
         case GGML_OP_SOFT_MAX:
             return gcu_op_soft_max(ctx, node);
+        case GGML_OP_RMS_NORM:
+            return gcu_op_rms_norm(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -1105,6 +1199,12 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(op);
             if (uop != GGML_UNARY_OP_SILU) return false;
+            if (!gcu_dtype_supported(op->src[0]->type)) return false;
+            if (op->src[0]->type != op->type) return false;
+            if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_RMS_NORM: {
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
