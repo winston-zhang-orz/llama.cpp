@@ -198,6 +198,85 @@ struct ggml_backend_gcu_context {
     ggml_backend_gcu_context & operator=(const ggml_backend_gcu_context &) = delete;
 };
 
+// === Device buffer ==================================================
+
+struct ggml_backend_gcu_buffer_context {
+    ggml_backend_gcu_context * ctx;
+    void *  base;
+    size_t  size;
+};
+
+static void ggml_backend_gcu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
+    bctx->ctx->pool.free(bctx->base, bctx->size);
+    delete bctx;
+}
+
+static void * ggml_backend_gcu_buffer_get_base(ggml_backend_buffer_t buffer) {
+    auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
+    return bctx->base;
+}
+
+static enum ggml_status ggml_backend_gcu_buffer_init_tensor(ggml_backend_buffer_t /*buffer*/, ggml_tensor * /*tensor*/) {
+    // Tensors are views into the slab; ggml-alloc has already set tensor->data.
+    return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_gcu_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+                                                  ggml_tensor * tensor,
+                                                  uint8_t value, size_t offset, size_t size) {
+    auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
+    TOPS_CHECK(topsSetDevice(bctx->ctx->device));
+    TOPS_CHECK(topsMemset((char *) tensor->data + offset, value, size));
+}
+
+static void ggml_backend_gcu_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                               ggml_tensor * tensor,
+                                               const void * data, size_t offset, size_t size) {
+    auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
+    TOPS_CHECK(topsSetDevice(bctx->ctx->device));
+    TOPS_CHECK(topsMemcpy((char *) tensor->data + offset, data, size, topsMemcpyHostToDevice));
+}
+
+static void ggml_backend_gcu_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                               const ggml_tensor * tensor,
+                                               void * data, size_t offset, size_t size) {
+    auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
+    TOPS_CHECK(topsSetDevice(bctx->ctx->device));
+    TOPS_CHECK(topsMemcpy(data, (const char *) tensor->data + offset, size, topsMemcpyDeviceToHost));
+}
+
+static bool ggml_backend_gcu_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
+                                               const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_buffer_is_host(src->buffer) && src->buffer->buft == dst->buffer->buft) {
+        auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
+        TOPS_CHECK(topsSetDevice(bctx->ctx->device));
+        TOPS_CHECK(topsMemcpy(dst->data, src->data, ggml_nbytes(src), topsMemcpyDeviceToDevice));
+        return true;
+    }
+    return false;
+}
+
+static void ggml_backend_gcu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
+    TOPS_CHECK(topsSetDevice(bctx->ctx->device));
+    TOPS_CHECK(topsMemset(bctx->base, value, bctx->size));
+}
+
+static const ggml_backend_buffer_i ggml_backend_gcu_buffer_i = {
+    /* .free_buffer     = */ ggml_backend_gcu_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_gcu_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_gcu_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_gcu_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_gcu_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_gcu_buffer_get_tensor,
+    /* .set_tensor_2d   = */ nullptr,
+    /* .get_tensor_2d   = */ nullptr,
+    /* .cpy_tensor      = */ ggml_backend_gcu_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_gcu_buffer_clear,
+    /* .reset           = */ nullptr,
+};
+
 // === ggml_backend_i (mostly stubs for now) ==========================
 
 static const char * ggml_backend_gcu_name(ggml_backend_t backend) {
