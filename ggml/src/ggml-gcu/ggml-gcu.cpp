@@ -811,6 +811,16 @@ static bool gcu_op_get_rows(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// SILU. y = x * sigmoid(x). Same dtype in/out, contiguous.
+static bool gcu_op_silu(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, dlhs;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, dlhs);
+    TOPSATEN_CHECK(topsatenSilu(out, in, ctx->stream));
+    return true;
+}
+
 static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_RESHAPE:
@@ -834,6 +844,13 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_cpy(ctx, node);
         case GGML_OP_MUL_MAT:
             return gcu_op_mul_mat(ctx, node);
+        case GGML_OP_UNARY: {
+            const enum ggml_unary_op uop = ggml_get_unary_op(node);
+            switch (uop) {
+                case GGML_UNARY_OP_SILU: return gcu_op_silu(ctx, node);
+                default: return false;
+            }
+        }
         default:
             return false;
     }
@@ -1028,6 +1045,14 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (x->ne[2] != 1 || x->ne[3] != 1) return false;
             if (w->ne[0] != x->ne[0]) return false;
             if (!ggml_is_contiguous(w) || !ggml_is_contiguous(x)) return false;
+            return true;
+        }
+        case GGML_OP_UNARY: {
+            const enum ggml_unary_op uop = ggml_get_unary_op(op);
+            if (uop != GGML_UNARY_OP_SILU) return false;
+            if (!gcu_dtype_supported(op->src[0]->type)) return false;
+            if (op->src[0]->type != op->type) return false;
+            if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
             return true;
         }
         default:
