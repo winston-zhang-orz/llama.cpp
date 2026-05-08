@@ -119,6 +119,47 @@ struct ggml_backend_gcu_context {
     ggml_backend_gcu_context & operator=(const ggml_backend_gcu_context &) = delete;
 };
 
+// === ggml_backend_i (mostly stubs for now) ==========================
+
+static const char * ggml_backend_gcu_name(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_gcu_context *) backend->context;
+    return ctx->name.c_str();
+}
+
+static void ggml_backend_gcu_free(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_gcu_context *) backend->context;
+    delete ctx;
+    delete backend;
+}
+
+static void ggml_backend_gcu_synchronize(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_gcu_context *) backend->context;
+    TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+}
+
+static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t /*backend*/, struct ggml_cgraph * /*cgraph*/) {
+    GGML_ABORT("ggml_backend_gcu_graph_compute not implemented yet");
+}
+
+static const ggml_backend_i ggml_backend_gcu_i = {
+    /* .get_name             = */ ggml_backend_gcu_name,
+    /* .free                 = */ ggml_backend_gcu_free,
+    /* .set_tensor_async     = */ nullptr,
+    /* .get_tensor_async     = */ nullptr,
+    /* .set_tensor_2d_async  = */ nullptr,
+    /* .get_tensor_2d_async  = */ nullptr,
+    /* .cpy_tensor_async     = */ nullptr,
+    /* .synchronize          = */ ggml_backend_gcu_synchronize,
+    /* .graph_plan_create    = */ nullptr,
+    /* .graph_plan_free      = */ nullptr,
+    /* .graph_plan_update    = */ nullptr,
+    /* .graph_plan_compute   = */ nullptr,
+    /* .graph_compute        = */ ggml_backend_gcu_graph_compute,
+    /* .event_record         = */ nullptr,
+    /* .event_wait           = */ nullptr,
+    /* .graph_optimize       = */ nullptr,
+};
+
 // === Stubs (filled in subsequent phases) =============================
 
 extern "C" {
@@ -147,11 +188,24 @@ void ggml_backend_gcu_get_device_memory(int32_t device, size_t * free, size_t * 
 }
 
 bool ggml_backend_is_gcu(ggml_backend_t /*backend*/) {
-    return false;
+    return false;   // patched in B5 once we have a GUID
 }
 
-ggml_backend_t ggml_backend_gcu_init(int32_t /*device*/) {
-    return nullptr;
+ggml_backend_t ggml_backend_gcu_init(int32_t device) {
+    if (device < 0 || device >= ggml_backend_gcu_get_device_count()) {
+        GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
+        return nullptr;
+    }
+
+    auto * ctx = new ggml_backend_gcu_context(device);
+
+    auto * backend = new ggml_backend{
+        /* .guid    = */ nullptr,         // filled in B5
+        /* .iface   = */ ggml_backend_gcu_i,
+        /* .device  = */ nullptr,         // filled in by device.init_backend (Phase C)
+        /* .context = */ ctx,
+    };
+    return backend;
 }
 
 ggml_backend_reg_t ggml_backend_gcu_reg(void) {
