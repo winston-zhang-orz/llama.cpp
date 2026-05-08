@@ -174,6 +174,14 @@ struct ggml_backend_gcu_context {
     topsStream_t stream        = nullptr;
     gcu_pool     pool;          // declared after stream so it's destroyed first
 
+    // Per-context zero-filled scratch used as bias for topsatenLinear's
+    // mandatory bias parameter. Grows on demand to the largest output row
+    // count seen so far, in F32 (largest dtype we use), and reinterpreted
+    // for F16 calls. Protected by the same single stream as compute, so
+    // no lock is needed.
+    void *  zero_bias       = nullptr;
+    size_t  zero_bias_bytes = 0;
+
     explicit ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
         TOPS_CHECK(topsSetDevice(device));
         gcu_global_init_inc();
@@ -192,6 +200,11 @@ struct ggml_backend_gcu_context {
     }
 
     ~ggml_backend_gcu_context() {
+        if (zero_bias) {
+            pool.free(zero_bias, zero_bias_bytes);
+            zero_bias = nullptr;
+            zero_bias_bytes = 0;
+        }
         if (stream) {
             TOPS_CHECK(topsStreamSynchronize(stream));
             TOPS_CHECK(topsStreamDestroy(stream));
@@ -595,6 +608,71 @@ static bool gcu_op_scale(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// Returns a device pointer to at least n_bytes of zero memory. Grows the
+// per-context zero buffer on demand. Assumes single-stream serialization
+// so no extra synchronization is needed between resize and use.
+static void * gcu_get_zero_bias(ggml_backend_gcu_context * ctx, size_t n_bytes) {
+    if (ctx->zero_bias_bytes < n_bytes) {
+        if (ctx->zero_bias) {
+            ctx->pool.free(ctx->zero_bias, ctx->zero_bias_bytes);
+        }
+        ctx->zero_bias       = ctx->pool.alloc(n_bytes);
+        ctx->zero_bias_bytes = n_bytes;
+        TOPS_CHECK(topsMemsetAsync(ctx->zero_bias, 0, n_bytes, ctx->stream));
+    }
+    return ctx->zero_bias;
+}
+
+// MUL_MAT.
+//
+// ggml's MUL_MAT semantics: dst = src[0]^T @ src[1]
+//   src[0] is the weight matrix in [K, M] ggml-shape (ne[0]=K, ne[1]=M).
+//   src[1] is the input             in [K, N] ggml-shape (ne[0]=K, ne[1]=N).
+//   dst                             in [M, N] ggml-shape (ne[0]=M, ne[1]=N).
+//
+// PyTorch Linear: out = x @ W^T + b, where x:[N,K], W:[M,K], b:[M].
+// topsatenLinear requires lhs/rhs to be rank-2; we always build rank-2
+// tensors explicitly (ggml_n_dims trims trailing 1s, which would give
+// rank-1 for a [K, 1] weight and topsaten rejects that).
+static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * w = dst->src[0];
+    ggml_tensor * x = dst->src[1];
+
+    auto build_2d = [](const ggml_tensor * t, int64_t (& d)[2], int64_t (& s)[2]) {
+        const size_t bpe = ggml_type_size(t->type);
+        d[0] = t->ne[1];                        // PyTorch outer = ggml ne[1]
+        d[1] = t->ne[0];                        // PyTorch inner = ggml ne[0]
+        s[0] = (int64_t) (t->nb[1] / bpe);
+        s[1] = (int64_t) (t->nb[0] / bpe);
+    };
+
+    int64_t lhs_d[2], lhs_s[2];   // x:  [N, K]
+    int64_t rhs_d[2], rhs_s[2];   // w:  [M, K]
+    int64_t out_d[2], out_s[2];   // dst:[N, M]
+    build_2d(x,   lhs_d, lhs_s);
+    build_2d(w,   rhs_d, rhs_s);
+    build_2d(dst, out_d, out_s);
+
+    topsatenTensor lhs(topsatenSize_t(lhs_d, 2), topsatenSize_t(lhs_s, 2),
+                       ggml_to_topsaten_dtype(x->type), x->data);
+    topsatenTensor rhs(topsatenSize_t(rhs_d, 2), topsatenSize_t(rhs_s, 2),
+                       ggml_to_topsaten_dtype(w->type), w->data);
+    topsatenTensor out(topsatenSize_t(out_d, 2), topsatenSize_t(out_s, 2),
+                       ggml_to_topsaten_dtype(dst->type), dst->data);
+
+    // Bias: shape [M], zero, in dst's dtype.
+    const int64_t M = dst->ne[0];
+    const size_t  bias_bytes = (size_t) M * ggml_type_size(dst->type);
+    void * bias_dev = gcu_get_zero_bias(ctx, bias_bytes);
+    int64_t bias_d[1] = { M };
+    int64_t bias_s[1] = { 1 };
+    topsatenTensor bias(topsatenSize_t(bias_d, 1), topsatenSize_t(bias_s, 1),
+                        ggml_to_topsaten_dtype(dst->type), bias_dev);
+
+    TOPSATEN_CHECK(topsatenLinear(out, lhs, rhs, bias, ctx->stream));
+    return true;
+}
+
 // MVP-1: CPY/DUP/CONT support same-dtype contiguous moves via topsMemcpy.
 // Dtype-converting / non-contiguous copies are refused upstream.
 static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
@@ -658,6 +736,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
         case GGML_OP_DUP:
         case GGML_OP_CONT:
             return gcu_op_cpy(ctx, node);
+        case GGML_OP_MUL_MAT:
+            return gcu_op_mul_mat(ctx, node);
         default:
             return false;
     }
@@ -810,6 +890,23 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (src->type != op->type) return false;
             if (!gcu_dtype_supported(src->type) || !gcu_dtype_supported(op->type)) return false;
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_MUL_MAT: {
+            const ggml_tensor * w = op->src[0];
+            const ggml_tensor * x = op->src[1];
+            if (!w || !x) return false;
+            // topsatenLinear requires lhs.dtype == rhs.dtype == out.dtype.
+            // ggml's MUL_MAT always produces F32 output, so MVP-1 supports
+            // only the all-F32 case. F16 inputs (which produce F32 output)
+            // need a cast and are MVP-2 work.
+            if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+                op->type != GGML_TYPE_F32) return false;
+            // 2D unbatched matmul, contiguous, shared K.
+            if (w->ne[2] != 1 || w->ne[3] != 1) return false;
+            if (x->ne[2] != 1 || x->ne[3] != 1) return false;
+            if (w->ne[0] != x->ne[0]) return false;
+            if (!ggml_is_contiguous(w) || !ggml_is_contiguous(x)) return false;
             return true;
         }
         default:
