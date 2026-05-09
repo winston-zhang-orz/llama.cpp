@@ -1141,6 +1141,193 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// MUL_MAT_ID: indirect matmul for MoE expert routing.
+//
+//   src[0]  as  -> [cols, rows, n_expert]            expert weight matrices
+//   src[1]  b   -> [cols, n_expert_used, n_tokens]   input activations
+//                                                    (n_expert_used dim may
+//                                                     broadcast from 1)
+//   src[2]  ids -> [n_expert_used, n_tokens] i32     expert assignments
+//   dst     c   -> [rows, n_expert_used, n_tokens]   F32
+//
+//   c[:, e, t] = as[:, :, ids[e, t]] @ b[:, e % b->ne[1], t]
+//
+// Implementation: read ids host-side, then loop over (token, expert_slot)
+// pairs, issuing one topsatenLinear call per pair. With MVP-4b's queued
+// ops each call is one driver enqueue rather than a host round-trip, so
+// the launch-overhead budget is bounded for tg (n_tokens=1, ~few experts
+// per layer). Q-typed weights live as F16 on the device (MVP-3a
+// dequant-on-load); the F16 path casts F32 input to F16 once for the
+// whole sweep and casts each F16 output row back to F32 at the dst slot.
+//
+// Optimization opportunity (future): gather tokens by expert to fold
+// each expert's per-token calls into a single batched matmul. Saves call
+// count for prompt processing where n_tokens is large.
+static bool gcu_op_mul_mat_id(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    const ggml_tensor * w   = dst->src[0];
+    const ggml_tensor * x   = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->ne[3] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+
+    const int64_t cols          = w->ne[0];
+    const int64_t rows          = w->ne[1];
+    const int64_t n_expert      = w->ne[2];
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_tokens      = ids->ne[1];
+    const int64_t r             = x->ne[1];
+
+    GGML_ASSERT(x->ne[0] == cols);
+    GGML_ASSERT(x->ne[2] == n_tokens);
+    GGML_ASSERT(n_expert_used % r == 0);
+
+    const ggml_type wt = w->type;
+    const ggml_type xt = x->type;
+    const bool      wq    = gcu_q_supported(wt);
+    const bool      w_f16 = wq || wt == GGML_TYPE_F16;
+    GGML_ASSERT(w_f16 || wt == GGML_TYPE_F32);
+    GGML_ASSERT(xt == GGML_TYPE_F32 || xt == GGML_TYPE_F16);
+
+    // Drain compute_stream so the i32 values in ids are fully written
+    // (they may have been produced by a preceding op on the same stream),
+    // then read host-side.
+    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
+    std::vector<int32_t> ids_host((size_t) n_expert_used * (size_t) n_tokens);
+    TOPS_CHECK(topsMemcpy(ids_host.data(), ids->data,
+                          ids_host.size() * sizeof(int32_t),
+                          topsMemcpyDeviceToHost));
+
+    // For the F16-weight path, cast all of x to F16 once up front and
+    // index into the cast buffer in the inner loop. Avoids per-call cast
+    // overhead at the cost of one [cols, r, n_tokens]-sized scratch.
+    void * x_f16_buf  = nullptr;
+    size_t x_f16_bytes = 0;
+    if (w_f16 && xt == GGML_TYPE_F32) {
+        const int64_t x_total = cols * r * n_tokens;
+        x_f16_bytes = (size_t) x_total * sizeof(uint16_t);
+        x_f16_buf   = ctx->pool.alloc(x_f16_bytes);
+
+        int64_t xd[1] = { x_total };
+        int64_t xs[1] = { 1 };
+        topsatenTensor x_f32(topsatenSize_t(xd, 1), topsatenSize_t(xs, 1),
+                             TOPSATEN_DATA_FP32, x->data);
+        topsatenTensor x_f16(topsatenSize_t(xd, 1), topsatenSize_t(xs, 1),
+                             TOPSATEN_DATA_FP16, x_f16_buf);
+        topsatenDataType_t target_f16 = TOPSATEN_DATA_FP16;
+        TOPSATEN_CHECK(topsatenTo(x_f16, x_f32, target_f16, false, true,
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
+    }
+
+    // Per-call F16 output scratch. Reused across the loop — same-stream
+    // ordering guarantees the previous call's cast-to-F32 finishes before
+    // the next call overwrites the buffer.
+    void * y_f16_buf  = nullptr;
+    size_t y_f16_bytes = 0;
+    if (w_f16) {
+        y_f16_bytes = (size_t) rows * sizeof(uint16_t);
+        y_f16_buf   = ctx->pool.alloc(y_f16_bytes);
+    }
+
+    // Zero bias sized for one row of the chosen output dtype.
+    const size_t bias_bytes = w_f16
+        ? (size_t) rows * sizeof(uint16_t)
+        : (size_t) rows * sizeof(float);
+    void * bias_dev = gcu_get_zero_bias(ctx, bias_bytes);
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            const int32_t expert_id = ids_host[t * n_expert_used + e];
+            GGML_ASSERT(expert_id >= 0 && expert_id < n_expert);
+
+            // Weight pointer for this expert. Q-typed weights live on
+            // the device as F16 with their own packed stride.
+            void * w_ptr;
+            if (wq) {
+                const size_t f16_per_expert = (size_t) cols * rows * sizeof(uint16_t);
+                w_ptr = (char *) w->data + (size_t) expert_id * f16_per_expert;
+            } else {
+                w_ptr = (char *) w->data + (size_t) expert_id * w->nb[2];
+            }
+
+            // Input pointer for this (e, t) slot.
+            const int64_t e_b = e % r;
+            void * x_ptr;
+            if (w_f16 && xt == GGML_TYPE_F32) {
+                const size_t off_elems = (size_t) (t * r + e_b) * (size_t) cols;
+                x_ptr = (char *) x_f16_buf + off_elems * sizeof(uint16_t);
+            } else {
+                x_ptr = (char *) x->data
+                      + (size_t) t * x->nb[2]
+                      + (size_t) e_b * x->nb[1];
+            }
+
+            // Output slot in dst.
+            void * dst_ptr = (char *) dst->data
+                           + (size_t) t * dst->nb[2]
+                           + (size_t) e * dst->nb[1];
+
+            int64_t lhs_d[2] = { 1, cols };
+            int64_t lhs_s[2] = { cols, 1 };
+            int64_t rhs_d[2] = { rows, cols };
+            int64_t rhs_s[2];
+            int64_t out_d[2] = { 1, rows };
+            int64_t out_s[2] = { rows, 1 };
+            int64_t bias_d[1] = { rows };
+            int64_t bias_s[1] = { 1 };
+
+            if (w_f16) {
+                // Q-stored-as-F16 has packed F16 strides; F16 native uses
+                // its declared nb[].
+                if (wq) {
+                    rhs_s[0] = cols;
+                    rhs_s[1] = 1;
+                } else {
+                    rhs_s[0] = (int64_t) (w->nb[1] / sizeof(uint16_t));
+                    rhs_s[1] = 1;
+                }
+
+                topsatenTensor lhs_f16(topsatenSize_t(lhs_d, 2), topsatenSize_t(lhs_s, 2),
+                                       TOPSATEN_DATA_FP16, x_ptr);
+                topsatenTensor rhs_f16(topsatenSize_t(rhs_d, 2), topsatenSize_t(rhs_s, 2),
+                                       TOPSATEN_DATA_FP16, w_ptr);
+                topsatenTensor out_f16(topsatenSize_t(out_d, 2), topsatenSize_t(out_s, 2),
+                                       TOPSATEN_DATA_FP16, y_f16_buf);
+                topsatenTensor bias_f16(topsatenSize_t(bias_d, 1), topsatenSize_t(bias_s, 1),
+                                        TOPSATEN_DATA_FP16, bias_dev);
+                TOPSATEN_CHECK(topsatenLinear(out_f16, lhs_f16, rhs_f16, bias_f16,
+                                              ctx->compute_stream));
+
+                topsatenTensor out_f32(topsatenSize_t(out_d, 2), topsatenSize_t(out_s, 2),
+                                       TOPSATEN_DATA_FP32, dst_ptr);
+                topsatenDataType_t target_f32 = TOPSATEN_DATA_FP32;
+                TOPSATEN_CHECK(topsatenTo(out_f32, out_f16, target_f32,
+                                          false, true, TOPSATEN_MEMORY_CONTIGUOUS,
+                                          ctx->compute_stream));
+            } else {
+                rhs_s[0] = (int64_t) (w->nb[1] / sizeof(float));
+                rhs_s[1] = 1;
+
+                topsatenTensor lhs(topsatenSize_t(lhs_d, 2), topsatenSize_t(lhs_s, 2),
+                                   TOPSATEN_DATA_FP32, x_ptr);
+                topsatenTensor rhs(topsatenSize_t(rhs_d, 2), topsatenSize_t(rhs_s, 2),
+                                   TOPSATEN_DATA_FP32, w_ptr);
+                topsatenTensor out(topsatenSize_t(out_d, 2), topsatenSize_t(out_s, 2),
+                                   TOPSATEN_DATA_FP32, dst_ptr);
+                topsatenTensor bias(topsatenSize_t(bias_d, 1), topsatenSize_t(bias_s, 1),
+                                    TOPSATEN_DATA_FP32, bias_dev);
+                TOPSATEN_CHECK(topsatenLinear(out, lhs, rhs, bias, ctx->compute_stream));
+            }
+        }
+    }
+
+    gcu_release_scratch(ctx, x_f16_buf, x_f16_bytes);
+    gcu_release_scratch(ctx, y_f16_buf, y_f16_bytes);
+    return true;
+}
+
 // CPY/DUP/CONT. Same dtype + contiguous → fast topsMemcpyAsync(D2D).
 // Different dtype (F32↔F16, both contiguous) → topsatenTo cast.
 static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
@@ -1497,6 +1684,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_cpy(ctx, node);
         case GGML_OP_MUL_MAT:
             return gcu_op_mul_mat(ctx, node);
+        case GGML_OP_MUL_MAT_ID:
+            return gcu_op_mul_mat_id(ctx, node);
         case GGML_OP_SOFT_MAX:
             return gcu_op_soft_max(ctx, node);
         case GGML_OP_RMS_NORM:
@@ -1719,6 +1908,50 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (x->ne[2] != 1 || x->ne[3] != 1) return false;
             if (w->ne[0] != x->ne[0]) return false;
             if (!ggml_is_contiguous(w) || !ggml_is_contiguous(x)) return false;
+            return true;
+        }
+        case GGML_OP_MUL_MAT_ID: {
+            // MoE expert dispatch.
+            //   src[0] (w):   [cols, rows, n_expert]   weights
+            //   src[1] (x):   [cols, n_used_or_1, n_tokens]   input
+            //   src[2] (ids): [n_used, n_tokens] i32   expert routing
+            //   dst (c):      [rows, n_used, n_tokens] F32
+            const ggml_tensor * w   = op->src[0];
+            const ggml_tensor * x   = op->src[1];
+            const ggml_tensor * ids = op->src[2];
+            if (!w || !x || !ids) return false;
+            if (ids->type != GGML_TYPE_I32) return false;
+            if (op->type  != GGML_TYPE_F32) return false;
+
+            // Same dtype matrix as MUL_MAT for the (w, x) pair: F32×F32,
+            // F16×{F16,F32}, or Q-typed weight × {F16,F32}. Output is
+            // always F32 per the ggml MUL_MAT_ID contract.
+            bool ok = false;
+            if (w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32) ok = true;
+            if (w->type == GGML_TYPE_F16 &&
+                (x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32)) ok = true;
+            if (gcu_q_supported(w->type) &&
+                (x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32)) ok = true;
+            if (!ok) return false;
+
+            // Shape constraints from ggml_mul_mat_id():
+            //   w is 3D (n_expert in ne[2]), x is 3D (n_tokens in ne[2]),
+            //   ids is 2D, ne[1] == n_tokens, ne[0] is n_expert_used,
+            //   shared K = w->ne[0] == x->ne[0],
+            //   ids->ne[0] % x->ne[1] == 0 (broadcast on slot dim).
+            if (w->ne[3] != 1 || x->ne[3] != 1) return false;
+            if (ids->ne[2] != 1 || ids->ne[3] != 1) return false;
+            if (w->ne[0] != x->ne[0]) return false;
+            if (ids->ne[1] != x->ne[2]) return false;
+            if (x->ne[1] == 0 || ids->ne[0] % x->ne[1] != 0) return false;
+
+            // Contiguity: gcu_op_mul_mat_id assumes packed strides for
+            // pointer-arithmetic into individual expert / token / slot
+            // slices. ids is also read via a single linear topsMemcpy.
+            if (!ggml_is_contiguous(w))   return false;
+            if (!ggml_is_contiguous(x))   return false;
+            if (!ggml_is_contiguous(ids)) return false;
+            if (!ggml_is_contiguous(op))  return false;
             return true;
         }
         case GGML_OP_UNARY: {

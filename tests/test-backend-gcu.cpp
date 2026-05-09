@@ -459,6 +459,109 @@ static int test_mul_mat_mixed(ggml_backend_t gcu) {
     return 0;
 }
 
+// MUL_MAT_ID smoke: MoE expert dispatch on a small tractable shape.
+//   as:  [K, M, n_expert]                F32 expert weights
+//   b:   [K, n_expert_used, n_tokens]    F32 input
+//   ids: [n_expert_used, n_tokens] i32   expert routing
+//   c:   [M, n_expert_used, n_tokens]    F32 output
+// Reference: c[m, e, t] = sum_k as[k, m, ids[e, t]] * b[k, e, t]
+static int test_mul_mat_id(ggml_backend_t gcu) {
+    const int64_t K = 256;
+    const int64_t M = 512;
+    const int64_t n_expert      = 4;
+    const int64_t n_expert_used = 2;
+    const int64_t n_tokens      = 8;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * as_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, M, n_expert);
+    ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_expert_used, n_tokens);
+    ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+    ggml_tensor * c    = ggml_mul_mat_id(ctx, as_w, b, ids);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) {
+        fprintf(stderr, "MUL_MAT_ID: alloc failed\n");
+        ggml_free(ctx);
+        return 1;
+    }
+
+    std::vector<float>   h_as((size_t) K * M * n_expert);
+    std::vector<float>   h_b ((size_t) K * n_expert_used * n_tokens);
+    std::vector<int32_t> h_ids((size_t) n_expert_used * n_tokens);
+    std::vector<float>   h_c ((size_t) M * n_expert_used * n_tokens);
+    std::vector<float>   expected((size_t) M * n_expert_used * n_tokens);
+
+    fill_random_f32(h_as.data(), h_as.size(), 31);
+    fill_random_f32(h_b.data(),  h_b.size(),  32);
+
+    // Round-robin expert assignment with offset per slot for variety.
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            h_ids[t * n_expert_used + e] = (int32_t) ((t + e * 2) % n_expert);
+        }
+    }
+
+    // CPU reference.
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            const int32_t expert_id = h_ids[t * n_expert_used + e];
+            const float * w_mat = h_as.data() + (size_t) expert_id * M * K;
+            const float * b_vec = h_b.data()  + (size_t)(t * n_expert_used + e) * K;
+            float       * c_vec = expected.data() + (size_t)(t * n_expert_used + e) * M;
+            for (int64_t m = 0; m < M; m++) {
+                float acc = 0.0f;
+                const float * w_row = w_mat + m * K;
+                for (int64_t k = 0; k < K; k++) acc += w_row[k] * b_vec[k];
+                c_vec[m] = acc;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(as_w, h_as.data(),  0, h_as.size()  * sizeof(float));
+    ggml_backend_tensor_set(b,    h_b.data(),   0, h_b.size()   * sizeof(float));
+    ggml_backend_tensor_set(ids,  h_ids.data(), 0, h_ids.size() * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_MAT_ID: compute failed\n");
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return 1;
+    }
+
+    ggml_backend_tensor_get(c, h_c.data(), 0, h_c.size() * sizeof(float));
+
+    int bad = 0;
+    for (size_t i = 0; i < h_c.size(); i++) {
+        // K=256 F32 sum; scale tolerance with K like the MUL_MAT test.
+        if (!close_enough(h_c[i], expected[i], 1e-2f, 1e-3f)) {
+            if (bad < 5) {
+                fprintf(stderr, "MUL_MAT_ID: mismatch idx=%zu got=%f want=%f\n",
+                        i, h_c[i], expected[i]);
+            }
+            bad++;
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MUL_MAT_ID: %d mismatches over %zu elements\n", bad, h_c.size());
+        return 1;
+    }
+    printf("MUL_MAT_ID: ok (%zu elements, %lld experts, %lld tokens)\n",
+           h_c.size(), (long long) n_expert, (long long) n_tokens);
+    return 0;
+}
+
 // Numerical-equality test for the async H<->D path. Builds an
 // (a + b) * c chain on GCU; populates the inputs via
 // ggml_backend_tensor_set_async, runs graph_compute, reads back via
@@ -562,6 +665,7 @@ int main() {
     rc |= test_softmax(gcu);
     rc |= test_rope(gcu);
     rc |= test_mul_mat_mixed(gcu);
+    rc |= test_mul_mat_id(gcu);
     rc |= test_async_overlap(gcu);
 
     ggml_backend_free(gcu);

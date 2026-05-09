@@ -603,7 +603,7 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 
 ### Operator coverage (MVP-2)
 
-**18 ops dispatched / 11 distinct kernels** (the 4 view ops are zero-copy and 3 of `CPY`/`DUP`/`CONT` share one handler). Any op or shape outside these is automatically routed to CPU by ggml's scheduler:
+**19 ops dispatched / 12 distinct kernels** (the 4 view ops are zero-copy and 3 of `CPY`/`DUP`/`CONT` share one handler). Any op or shape outside these is automatically routed to CPU by ggml's scheduler:
 
 - Element-wise: `ADD`, `MUL`, `SCALE` (bias = 0 only)
 - Activations: `SILU`
@@ -611,6 +611,7 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 - Position encoding: `ROPE` (mode 0 only — no NEOX, no YARN, no MROPE; F32 and F16)
 - Reduction: `SOFT_MAX` (with optional mask, `max_bias = 0`, no softmax sinks)
 - Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast; Q4_0 / Q8_0 / Q4_K weights via F16 dequant-on-load)
+- MoE dispatch: `MUL_MAT_ID` (same dtype matrix as `MUL_MAT`; per-(token, expert-slot) `topsatenLinear` loop; F16-weight path casts F32 input once for the whole sweep). Required for Gemma 4 26B A4B and other MoE models.
 - Indexing: `GET_ROWS` (F32 only, unbatched), `SET_ROWS` (F32 dst only — KV cache stays on CPU)
 - Memory: `CPY`/`DUP`/`CONT` (same-dtype contiguous + F32↔F16 conversion); view ops (`RESHAPE`, `VIEW`, `PERMUTE`, `TRANSPOSE`)
 
