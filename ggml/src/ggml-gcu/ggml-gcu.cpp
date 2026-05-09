@@ -76,6 +76,10 @@ static const char * topsaten_status_to_str(topsatenStatus_t s) {
         }                                                                           \
     } while (0)
 
+// Forward declaration: defined in the tensor-mapping section, used
+// earlier in the buffer-type code (init_tensor + get_alloc_size).
+static bool gcu_q_supported(ggml_type t);
+
 // === Process-level topsaten init refcount ===========================
 //
 // topsatenInit / topsatenFinalize are documented as process-global. Wrap
@@ -251,8 +255,17 @@ static void * ggml_backend_gcu_buffer_get_base(ggml_backend_buffer_t buffer) {
     return bctx->base;
 }
 
-static enum ggml_status ggml_backend_gcu_buffer_init_tensor(ggml_backend_buffer_t /*buffer*/, ggml_tensor * /*tensor*/) {
-    // Tensors are views into the slab; ggml-alloc has already set tensor->data.
+static enum ggml_status ggml_backend_gcu_buffer_init_tensor(ggml_backend_buffer_t /*buffer*/, ggml_tensor * tensor) {
+    // For Q-typed weight tensors, MVP-3a stores F16 bytes on the device.
+    // Rewrite nb[] to F16 strides so downstream stride math (in
+    // gcu_op_mul_mat etc.) indexes correctly.
+    if (gcu_q_supported(tensor->type)) {
+        const int64_t bpe_f16 = (int64_t) sizeof(uint16_t);
+        tensor->nb[0] = bpe_f16;
+        tensor->nb[1] = tensor->ne[0] * tensor->nb[0];
+        tensor->nb[2] = tensor->ne[1] * tensor->nb[1];
+        tensor->nb[3] = tensor->ne[2] * tensor->nb[2];
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -339,12 +352,22 @@ static size_t ggml_backend_gcu_buffer_type_get_max_size(ggml_backend_buffer_type
     return SIZE_MAX;
 }
 
+// MVP-3a: Q-typed weight tensors are stored as F16 on the device.
+// Over-report the allocation size so the slab is large enough.
+static size_t ggml_backend_gcu_buffer_type_get_alloc_size(
+        ggml_backend_buffer_type_t /*buft*/, const ggml_tensor * t) {
+    if (gcu_q_supported(t->type)) {
+        return (size_t) ggml_nelements(t) * sizeof(uint16_t);
+    }
+    return ggml_nbytes(t);
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_gcu_buffer_type_i = {
     /* .get_name        = */ ggml_backend_gcu_buffer_type_name,
     /* .alloc_buffer    = */ ggml_backend_gcu_buffer_type_alloc_buffer,
     /* .get_alignment   = */ ggml_backend_gcu_buffer_type_get_alignment,
     /* .get_max_size    = */ ggml_backend_gcu_buffer_type_get_max_size,
-    /* .get_alloc_size  = */ nullptr,    // default = ggml_nbytes
+    /* .get_alloc_size  = */ ggml_backend_gcu_buffer_type_get_alloc_size,
     /* .is_host         = */ nullptr,    // device buffer (not host-accessible)
 };
 
