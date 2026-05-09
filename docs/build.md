@@ -573,7 +573,16 @@ GCU prompt-processing wins at every tested length, peaking around pp128–512 (~
 
 **Partial offload** (`-ngl 12` of 24 layers): pp64 436 t/s — between CPU-only (388) and full-GCU (676), no crashes. Mixed CPU+GCU layer split works as expected.
 
-**Architecture coverage:** verified loading and running on Qwen 2 (Qwen 2.5 0.5B) and Llama (TinyLlama 15M Q4_0). Backend isn't Qwen-specific. For very small models like the 15M, CPU dominates because per-op GCU launch overhead exceeds the math savings — the GCU win starts mattering somewhere in the 100M–500M parameter range.
+**Architecture coverage:** verified loading and running on Qwen 2 (Qwen 2.5 0.5B) and Llama (TinyLlama 15M Q4_0, Llama 3.2 1.2B Q4_K_M). Backend isn't Qwen-specific.
+
+**Q4 model size scaling — the crossover** (where Q4 GCU starts beating Q4 CPU) is between 0.5B and 1.2B params:
+
+| Q4_K_M Model | pp64 CPU | pp64 GCU | Speedup |
+|---|---:|---:|---:|
+| Qwen 2.5 0.5B (~0.63B params) | 463 t/s | 309 t/s | 0.67× (CPU wins) |
+| Llama 3.2 1B (~1.24B params) | 240 t/s | **576 t/s** | **2.40× (GCU wins)** |
+
+A 3.6× swing from doubling the model size: GCU's per-op launch overhead amortizes over larger per-layer compute. Generation throughput is similar on both backends for both models (~30 t/s) because per-token decode is bounded by H↔D for the KV cache (`-nkvo` keeps it CPU-resident). For real models in this size range and up, **GCU is the clear win for prompt-heavy workloads** (RAG, summarization). Generation-heavy workloads see modest gains.
 
 **Recommended invocation for real models on GCU:**
 ```sh
