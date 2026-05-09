@@ -621,7 +621,15 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
 - BF16 not supported.
 - Only `ROPE` mode 0 is implemented; YARN / NEOX / MROPE go to CPU.
 - `SOFT_MAX` with `max_bias != 0` (alibi) and `softmax sinks` (a non-null `op->src[2]`) go to CPU.
-- Single device, single stream. Pinned host memory (`topsHostMalloc`) is enabled and used by the `-nkvo` KV cache (~5% tg uplift on Llama 1B Q4_K_M, set `GGML_GCU_NO_PINNED=1` to disable). Multi-device, async overlap, and native quantized matmul are MVP-3+ work.
+- Single device, single stream. Pinned host memory (`topsHostMalloc`) is enabled and used by the `-nkvo` KV cache. On Llama 3.2 1B Q4_K_M (`--device GCU0 -nkvo 1`, r=5):
+
+  | test  | pinned (default) | no-pinned         | uplift |
+  |-------|------------------|-------------------|--------|
+  | tg32  | 33.80 ± 0.23 t/s | 32.15 ± 0.09 t/s  | +5.1%  |
+  | tg64  | 34.27 ± 0.19 t/s | 31.12 ± 0.20 t/s  | +10.1% |
+  | pp512 | 677.34 ± 5.04    | 643.86 ± 8.24     | +5.2%  |
+
+  Set `GGML_GCU_NO_PINNED=1` to fall back to a normal CPU buffer. Multi-device, async overlap, and native quantized matmul are MVP-3+ work.
 
 ### Known SDK ceilings (per-topsaten investigation)
 
