@@ -563,6 +563,119 @@ static int test_mul_mat_id(ggml_backend_t gcu) {
     return 0;
 }
 
+// Q-weight × F32-input matmul. The Q tensor is populated via host-side
+// ggml_quantize_chunk; the GCU buffer's set_tensor dequantizes the Q
+// bytes to F16 on the device (MVP-3a dequant-on-load). Expected output
+// is computed from the *dequantized* F32 weight (the same lossy view
+// the device sees), so the comparison only needs to tolerate the F16
+// accumulation drift that comes from running matmul on the device.
+//
+// Returns 0 on success; prints "<label>: ok ..." or detail on mismatch.
+static int test_mul_mat_q_weight(ggml_backend_t gcu, ggml_type qt, const char * label) {
+    // K must be a multiple of the format's block size (32 for Q4_0 / Q8_0,
+    // 256 for Q4_K). Pick K = 256 so every supported type works.
+    const int64_t K = 256;
+    const int64_t M = 1024;
+    const int64_t N = 64;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, qt, K, M);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * c = ggml_mul_mat(ctx, w, x);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "%s: alloc failed\n", label); ggml_free(ctx); return 1; }
+
+    // Random F32 reference weight, then quantize to qt.
+    std::vector<float> w_f32_ref((size_t) K * M);
+    fill_random_f32(w_f32_ref.data(), w_f32_ref.size(), 91);
+
+    const size_t row_size_q = ggml_row_size(qt, K);
+    std::vector<uint8_t> w_quant((size_t) M * row_size_q);
+    const size_t actual = ggml_quantize_chunk(qt, w_f32_ref.data(), w_quant.data(),
+                                              0, M, K, /*imatrix=*/ nullptr);
+    if (actual != w_quant.size()) {
+        fprintf(stderr, "%s: quantize_chunk returned %zu, expected %zu\n",
+                label, actual, w_quant.size());
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+
+    // Dequantize back to F32 so we have the same "lossy" view the device
+    // operates on. The device stores F16 of this; the F16 conversion
+    // adds a tiny additional drift (handled by the tolerance below).
+    const ggml_type_traits * tt = ggml_get_type_traits(qt);
+    if (!tt || !tt->to_float) {
+        fprintf(stderr, "%s: no to_float trait for type\n", label);
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    std::vector<float> w_f32_lossy((size_t) K * M);
+    tt->to_float(w_quant.data(), w_f32_lossy.data(), (size_t) K * M);
+
+    std::vector<float> hx((size_t) K * N);
+    fill_random_f32(hx.data(), hx.size(), 92);
+
+    // Reference: c[m, n] = sum_k w_lossy[m*K + k] * x[n*K + k]
+    std::vector<float> expected((size_t) M * N), hc((size_t) M * N);
+    for (int64_t n = 0; n < N; n++) {
+        for (int64_t m = 0; m < M; m++) {
+            float acc = 0.0f;
+            const float * wp = w_f32_lossy.data() + m * K;
+            const float * xp = hx.data()          + n * K;
+            for (int64_t k = 0; k < K; k++) acc += wp[k] * xp[k];
+            expected[m + n * M] = acc;
+        }
+    }
+
+    // Set the Q bytes on the device — buffer.set_tensor dequants to F16.
+    ggml_backend_tensor_set(w, w_quant.data(), 0, w_quant.size());
+    ggml_backend_tensor_set(x, hx.data(),      0, hx.size() * sizeof(float));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: compute failed\n", label);
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(float));
+
+    // Tolerance: K=256 F16-accumulated F32 sums against an F32 reference.
+    // The F16-rounding of the dequantized weight introduces ~2^-11 ≈ 5e-4
+    // relative error per element; the K-long sum amplifies that. The
+    // accumulator on the device is F16 (topsatenLinear's F16 path), so
+    // expect ~1% relative drift on typical magnitudes plus a small atol
+    // for sums near zero.
+    int bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < hc.size(); i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 5e-2f, 1e-2f)) {
+            if (bad < 5) fprintf(stderr, "%s: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 label, i, hc[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "%s: %d mismatches over %zu (max_abs_err=%f)\n",
+                label, bad, hc.size(), max_err);
+        return 1;
+    }
+    printf("%s: ok (%zu elements, max_abs_err=%f)\n", label, hc.size(), max_err);
+    return 0;
+}
+
+static int test_mul_mat_q4_0(ggml_backend_t gcu) { return test_mul_mat_q_weight(gcu, GGML_TYPE_Q4_0, "MUL_MAT_Q4_0"); }
+static int test_mul_mat_q8_0(ggml_backend_t gcu) { return test_mul_mat_q_weight(gcu, GGML_TYPE_Q8_0, "MUL_MAT_Q8_0"); }
+static int test_mul_mat_q4_k(ggml_backend_t gcu) { return test_mul_mat_q_weight(gcu, GGML_TYPE_Q4_K, "MUL_MAT_Q4_K"); }
+
 // Element-wise MUL: dst = a * b on F32, large 2D tensor. Mirrors test_add.
 static int test_mul(ggml_backend_t gcu) {
     const int64_t M = 1024, N = 4096;
@@ -968,6 +1081,9 @@ int main() {
     rc |= test_set_rows(gcu);
     rc |= test_cpy(gcu);
     rc |= test_mul_mat(gcu);
+    rc |= test_mul_mat_q4_0(gcu);
+    rc |= test_mul_mat_q8_0(gcu);
+    rc |= test_mul_mat_q4_k(gcu);
     rc |= test_silu(gcu);
     rc |= test_rms_norm(gcu);
     rc |= test_softmax(gcu);
