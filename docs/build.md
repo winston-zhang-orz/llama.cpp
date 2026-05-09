@@ -629,7 +629,25 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
   | tg64  | 34.27 ± 0.19 t/s | 31.12 ± 0.20 t/s  | +10.1% |
   | pp512 | 677.34 ± 5.04    | 643.86 ± 8.24     | +5.2%  |
 
-  Set `GGML_GCU_NO_PINNED=1` to fall back to a normal CPU buffer. Multi-device, async overlap, and native quantized matmul are MVP-3+ work.
+  Set `GGML_GCU_NO_PINNED=1` to fall back to a normal CPU buffer.
+
+  Async H↔D / compute overlap (`topsMemcpyAsync` on a dedicated copy stream, event-mediated handoff with the compute stream — MVP-4a) stacks on top of pinned memory. Llama 3.2 1B Q4_K_M (`--device GCU0 -nkvo 1`, r=5):
+
+  | test  | MVP-4a active        | MVP-4a disabled      | uplift |
+  |-------|----------------------|----------------------|--------|
+  | tg32  | 30.95 ± 0.29 t/s     | 30.93 ± 0.12 t/s     | +0.1%  |
+  | tg64  | 31.36 ± 0.10 t/s     | 31.05 ± 0.16 t/s     | +1.0%  |
+  | pp512 | 672.52 ± 16.13 t/s   | 677.81 ± 17.76 t/s   | -0.8%  |
+
+  Qwen 2.5 0.5B F16 (`--device GCU0 -nkvo 1`, r=5):
+
+  | test  | MVP-4a active        | MVP-4a disabled      | uplift |
+  |-------|----------------------|----------------------|--------|
+  | tg32  | 33.50 ± 0.63 t/s     | 31.28 ± 1.14 t/s     | +7.1%  |
+  | tg64  | 32.83 ± 0.75 t/s     | 31.58 ± 0.73 t/s     | +4.0%  |
+  | pp512 | 1650.18 ± 39.71 t/s  | 1669.72 ± 3.15 t/s   | -1.2%  |
+
+  Set `GGML_GCU_NO_ASYNC_COPY=1` to fall back to synchronous `topsMemcpy`. Multi-device support is MVP-5 work.
 
 ### Known SDK ceilings (per-topsaten investigation)
 
