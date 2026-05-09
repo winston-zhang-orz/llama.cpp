@@ -461,6 +461,120 @@ static int test_mul_mat_mixed(ggml_backend_t gcu) {
     return 0;
 }
 
+// === MVP-5a unary activations ===========================================
+//
+// Shared smoke harness for the new GGML_OP_UNARY ops added in MVP-5a.
+// Each test creates a 1D F32 tensor, applies the chosen ggml unary op,
+// and checks the result against a host-side reference. Tolerances are
+// per-op (some activations like GELU have transcendental inner ops with
+// modest precision; RELU is exact).
+struct unary_test_spec {
+    const char *  label;
+    int           seed;
+    float         atol;
+    float         rtol;
+    ggml_tensor * (*build_op)(ggml_context * ctx, ggml_tensor * a);
+    float         (*ref)(float x);
+};
+
+static int run_unary_test(ggml_backend_t gcu, const unary_test_spec & s) {
+    const size_t n = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_tensor * c = s.build_op(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "%s: alloc failed\n", s.label); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, (uint32_t) s.seed);
+    for (size_t i = 0; i < n; i++) expected[i] = s.ref(ha[i]);
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: compute failed\n", s.label);
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], s.atol, s.rtol)) {
+            if (bad < 5) fprintf(stderr, "%s: mismatch idx=%zu got=%f want=%f\n",
+                                 s.label, i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "%s: %d mismatches (max_abs_err=%f)\n", s.label, bad, max_err);
+        return 1;
+    }
+    printf("%s: ok (%zu elements, max_abs_err=%f)\n", s.label, n, max_err);
+    return 0;
+}
+
+// Reference activations (host-side F32 implementations). Match ggml's
+// ggml-cpu/ops.cpp definitions where they exist.
+static float ref_gelu(float x) {
+    // ggml's "exact" GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+    return 0.5f * x * (1.0f + std::erf(x / std::sqrt(2.0f)));
+}
+static float ref_gelu_quick(float x) {
+    // ggml's tanh-form GELU approximation:
+    //   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    const float k = std::sqrt(2.0f / 3.14159265358979323846f);
+    const float x3 = x * x * x;
+    return 0.5f * x * (1.0f + std::tanh(k * (x + 0.044715f * x3)));
+}
+static float ref_relu(float x)        { return x > 0.0f ? x : 0.0f; }
+static float ref_tanh(float x)        { return std::tanh(x); }
+static float ref_sigmoid(float x)     { return 1.0f / (1.0f + std::exp(-x)); }
+static float ref_hardswish(float x)   {
+    if (x <= -3.0f) return 0.0f;
+    if (x >=  3.0f) return x;
+    return x * (x + 3.0f) / 6.0f;
+}
+static float ref_hardsigmoid(float x) {
+    if (x <= -3.0f) return 0.0f;
+    if (x >=  3.0f) return 1.0f;
+    return (x + 3.0f) / 6.0f;
+}
+
+static int test_gelu(ggml_backend_t gcu) {
+    return run_unary_test(gcu, {"GELU",        301, 1e-4f, 1e-4f, ggml_gelu,        ref_gelu});
+}
+static int test_gelu_quick(ggml_backend_t gcu) {
+    return run_unary_test(gcu, {"GELU_QUICK",  302, 1e-3f, 1e-3f, ggml_gelu_quick,  ref_gelu_quick});
+}
+static int test_relu(ggml_backend_t gcu) {
+    return run_unary_test(gcu, {"RELU",        303, 0.0f,   0.0f, ggml_relu,        ref_relu});
+}
+static int test_tanh(ggml_backend_t gcu) {
+    return run_unary_test(gcu, {"TANH",        304, 1e-5f, 1e-5f, ggml_tanh,        ref_tanh});
+}
+static int test_sigmoid(ggml_backend_t gcu) {
+    return run_unary_test(gcu, {"SIGMOID",     305, 1e-5f, 1e-5f, ggml_sigmoid,     ref_sigmoid});
+}
+static int test_hardswish(ggml_backend_t gcu) {
+    return run_unary_test(gcu, {"HARDSWISH",   306, 1e-5f, 1e-5f, ggml_hardswish,   ref_hardswish});
+}
+static int test_hardsigmoid(ggml_backend_t gcu) {
+    return run_unary_test(gcu, {"HARDSIGMOID", 307, 1e-5f, 1e-5f, ggml_hardsigmoid, ref_hardsigmoid});
+}
+
 // MUL_MAT_MIXED variant with F16 input (instead of F32): F16w × F16x -> F32.
 // Fills the third dtype combo in the F16-weight family of MUL_MAT:
 //   F32w × F32x → F32   (test_mul_mat)
@@ -1903,6 +2017,13 @@ int main() {
     rc |= test_mul_mat_q4_k(gcu);
     rc |= test_silu(gcu);
     rc |= test_silu_f16(gcu);
+    rc |= test_gelu(gcu);
+    rc |= test_gelu_quick(gcu);
+    rc |= test_relu(gcu);
+    rc |= test_tanh(gcu);
+    rc |= test_sigmoid(gcu);
+    rc |= test_hardswish(gcu);
+    rc |= test_hardsigmoid(gcu);
     rc |= test_rms_norm(gcu);
     rc |= test_rms_norm_f16(gcu);
     rc |= test_softmax(gcu);

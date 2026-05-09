@@ -1673,6 +1673,78 @@ static bool gcu_op_silu(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// MVP-5a: additional unary activations. All follow the SILU template —
+// same-dtype contiguous in/out, single topsaten op call. The dispatch
+// (gcu_compute_node) and the GGML_OP_UNARY supports_op gate carry the
+// per-op routing.
+
+static bool gcu_op_gelu(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    // approximate="none" matches ggml's GELU_ERF formula and the standard
+    // Gemma / Phi / BERT GELU.
+    TOPSATEN_CHECK(topsatenGelu(out, in, "none", ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_gelu_quick(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    // approximate="tanh" matches ggml's tanh-form GELU approximation
+    // (Gemma 3, GPT-2 fast path).
+    TOPSATEN_CHECK(topsatenGelu(out, in, "tanh", ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_relu(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenRelu(out, in, ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_tanh(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenTanh(out, in, ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_sigmoid(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenSigmoid(out, in, ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_hardswish(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenHardswish(out, in, ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_hardsigmoid(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenHardsigmoid(out, in, ctx->compute_stream));
+    return true;
+}
+
 static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_RESHAPE:
@@ -1707,7 +1779,14 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
-                case GGML_UNARY_OP_SILU: return gcu_op_silu(ctx, node);
+                case GGML_UNARY_OP_SILU:        return gcu_op_silu(ctx, node);
+                case GGML_UNARY_OP_GELU:        return gcu_op_gelu(ctx, node);
+                case GGML_UNARY_OP_GELU_QUICK:  return gcu_op_gelu_quick(ctx, node);
+                case GGML_UNARY_OP_RELU:        return gcu_op_relu(ctx, node);
+                case GGML_UNARY_OP_TANH:        return gcu_op_tanh(ctx, node);
+                case GGML_UNARY_OP_SIGMOID:     return gcu_op_sigmoid(ctx, node);
+                case GGML_UNARY_OP_HARDSWISH:   return gcu_op_hardswish(ctx, node);
+                case GGML_UNARY_OP_HARDSIGMOID: return gcu_op_hardsigmoid(ctx, node);
                 default: return false;
             }
         }
@@ -1968,7 +2047,19 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
         }
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(op);
-            if (uop != GGML_UNARY_OP_SILU) return false;
+            switch (uop) {
+                case GGML_UNARY_OP_SILU:
+                case GGML_UNARY_OP_GELU:
+                case GGML_UNARY_OP_GELU_QUICK:
+                case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_TANH:
+                case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_HARDSWISH:
+                case GGML_UNARY_OP_HARDSIGMOID:
+                    break;
+                default:
+                    return false;
+            }
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
