@@ -534,6 +534,22 @@ If the SDK is installed to a non-standard path, override with `-DTOPS_INSTALL_DI
 ./build/bin/llama-cli -m model.gguf --device GCU0 -nkvo -p "Hello" -n 16
 ```
 
+### Performance (Qwen 2.5 0.5B-Instruct, F16, S60, 3 reps)
+
+Measured with `llama-bench`, `--device GCU0 -nkvo 1` versus `-ngl 0` baseline:
+
+| Test       | F16 CPU      | F16 GCU         | Speedup |
+|------------|-------------:|----------------:|--------:|
+| pp32       |  387.93 t/s  |   676.33 t/s    | 1.74×   |
+| pp128      |  467.72 t/s  |  1480.73 t/s    | 3.17×   |
+| pp512      |  463.27 t/s  |  1491.79 t/s    | 3.22×   |
+| tg16       |   30.51 t/s  |    35.05 t/s    | 1.15×   |
+| tg64       |   30.47 t/s  |    34.37 t/s    | 1.13×   |
+
+Prompt processing speeds up cleanly on GCU once the batch is large enough to amortize launch overhead (~3.2× from pp128 onward). Generation gain is small because per-token decode does H↔D copies for the KV cache (`-nkvo` keeps the cache on CPU). MVP-3 perf items: native KV cache offload, native quantized matmul (Q4 weights currently stay on CPU), pinned host buffers, async copy/compute overlap.
+
+For Q4 weights on this MVP-2 build, GCU is **slower** than CPU (Q4 dequant happens on CPU per layer, then activations bounce to GCU and back; the H↔D traffic exceeds GCU compute savings). Stick with `-ngl 0` for Q4 models until MVP-3.
+
 ### Operator coverage (MVP-2)
 
 The following ops are implemented on GCU. Any op or shape outside these is automatically routed to CPU by ggml's scheduler:
