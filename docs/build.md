@@ -548,7 +548,7 @@ Measured with `llama-bench`, `--device GCU0 -nkvo 1` versus `-ngl 0` baseline:
 
 Prompt processing speeds up cleanly on GCU once the batch is large enough to amortize launch overhead (~3.2× from pp128 onward). Generation gain is small because per-token decode does H↔D copies for the KV cache (`-nkvo` keeps the cache on CPU). MVP-3 perf items: native KV cache offload, native quantized matmul (Q4 weights currently stay on CPU), pinned host buffers, async copy/compute overlap.
 
-For Q4 weights on this MVP-2 build, GCU is **slower** than CPU (Q4 dequant happens on CPU per layer, then activations bounce to GCU and back; the H↔D traffic exceeds GCU compute savings). Stick with `-ngl 0` for Q4 models until MVP-3.
+For Q4 weights with MVP-3a's dequant-on-load path, GCU runs Q4_K_M at ~31 t/s tg32 / ~309 t/s pp64 — improvement over MVP-2's Q4 GCU (25 / 273) but still below Q4 CPU baseline (70 / 463) because llama.cpp's CPU Q4 kernels are very well tuned and our F16 dequant doubles weight memory plus pays per-token H↔D for the KV cache. Hitting parity with Q4 CPU needs native quantized matmul (`topsatenLinearQuant`) and KV cache offload to GCU — both are tracked for follow-up MVPs.
 
 ### Operator coverage (MVP-2)
 
@@ -559,13 +559,13 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
 - Normalization: `RMS_NORM`
 - Position encoding: `ROPE` (mode 0 only — no NEOX, no YARN, no MROPE; F32 only)
 - Reduction: `SOFT_MAX` (with optional mask, `max_bias = 0`, no softmax sinks)
-- Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast)
+- Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast; Q4_0 / Q8_0 / Q4_K weights via F16 dequant-on-load)
 - Indexing: `GET_ROWS` (F32 only, unbatched), `SET_ROWS` (F32 dst only — KV cache stays on CPU)
 - Memory: `CPY`/`DUP`/`CONT` (same-dtype contiguous + F32↔F16 conversion); view ops (`RESHAPE`, `VIEW`, `PERMUTE`, `TRANSPOSE`)
 
 ### Known limitations (MVP-2)
 
-- Quantized weights (Q4_K, Q8_0, etc.) stay on CPU. Models load fine; compute on quantized tensors is CPU-bound.
+- Q4_0, Q8_0, and Q4_K weight tensors are dequantized to F16 at model-load time (one-time host cost) and stored as F16 on GCU (2-4× the on-disk size). MUL_MAT then runs on GCU via the F16 path. Other Q-types (Q5_K, Q6_K, Q3_K, etc.) stay on CPU. Native quantized matmul via `topsatenLinearQuant` is a future MVP that would avoid the F16 expansion and likely match Q4 CPU performance.
 - KV cache is designed to stay on CPU. `SET_ROWS` to F16 destinations (the cache dtype) is refused on GCU. Pass `-nkvo` (`--no-kv-offload`) when offloading layers to GCU; without it llama.cpp tries to allocate the cache on GCU and the scheduler aborts at graph_reserve. With `-nkvo`, real Q4 / F16 models load and run on `--device GCU0` (Q4 weights and KV stay CPU; activation math runs on GCU). Native cache offload is MVP-3+ work.
 - BF16 not supported.
 - Only `ROPE` mode 0 is implemented; YARN / NEOX / MROPE go to CPU. F16 ROPE is also CPU-only on this SDK version.
