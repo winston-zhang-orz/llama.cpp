@@ -621,7 +621,7 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
 - BF16 not supported.
 - Only `ROPE` mode 0 is implemented; YARN / NEOX / MROPE go to CPU.
 - `SOFT_MAX` with `max_bias != 0` (alibi) and `softmax sinks` (a non-null `op->src[2]`) go to CPU.
-- Single device, single stream, no pinned host memory. Multi-device, async overlap, native quantized matmul are MVP-3+ work.
+- Single device, single stream. Pinned host memory (`topsHostMalloc`) is enabled and used by the `-nkvo` KV cache (~5% tg uplift on Llama 1B Q4_K_M, set `GGML_GCU_NO_PINNED=1` to disable). Multi-device, async overlap, and native quantized matmul are MVP-3+ work.
 
 ### Known SDK ceilings (per-topsaten investigation)
 

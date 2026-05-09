@@ -384,6 +384,68 @@ static size_t ggml_backend_gcu_buffer_type_get_alloc_size(
     return ggml_nbytes(t);
 }
 
+// === Host (pinned) buffer type ======================================
+//
+// Provides pinned host memory via topsHostMalloc. llama.cpp's KV cache
+// allocator picks this up when offered by the device (via the
+// get_host_buffer_type slot), giving faster H<->D copies for the
+// CPU-resident cache when running with -nkvo. Pattern matches CUDA's
+// ggml_backend_cuda_host_buffer_type — wrap pinned memory in a normal
+// CPU buffer and only override free.
+
+static void ggml_backend_gcu_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer->context) {
+        TOPS_CHECK(topsHostFree(buffer->context));
+    }
+}
+
+static void * gcu_host_malloc(size_t size) {
+    if (getenv("GGML_GCU_NO_PINNED") != nullptr) {
+        return nullptr;
+    }
+    void * ptr = nullptr;
+    topsError_t err = topsHostMalloc(&ptr, size, topsHostMallocDefault);
+    if (err != topsSuccess) {
+        GGML_LOG_DEBUG("%s: topsHostMalloc(%.2f MiB) failed: %s\n", __func__,
+                       size / 1024.0 / 1024.0, topsGetErrorString(err));
+        return nullptr;
+    }
+    return ptr;
+}
+
+static const char * ggml_backend_gcu_host_buffer_type_name(ggml_backend_buffer_type_t /*buft*/) {
+    return "GCU_Host";
+}
+
+static ggml_backend_buffer_t ggml_backend_gcu_host_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    void * ptr = gcu_host_malloc(size);
+    if (!ptr) {
+        // fall back to a normal CPU buffer
+        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft             = buft;
+    buffer->iface.free_buffer = ggml_backend_gcu_host_buffer_free_buffer;
+    return buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_gcu_host_buffer_type() {
+    static ggml_backend_buffer_type bt = {
+        /* .iface    = */ {
+            /* .get_name        = */ ggml_backend_gcu_host_buffer_type_name,
+            /* .alloc_buffer    = */ ggml_backend_gcu_host_buffer_type_alloc_buffer,
+            /* .get_alignment   = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size    = */ nullptr,
+            /* .get_alloc_size  = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .is_host         = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        },
+        /* .device   = */ nullptr,   // patched by device.get_host_buffer_type
+        /* .context  = */ nullptr,
+    };
+    return &bt;
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_gcu_buffer_type_i = {
     /* .get_name        = */ ggml_backend_gcu_buffer_type_name,
     /* .alloc_buffer    = */ ggml_backend_gcu_buffer_type_alloc_buffer,
@@ -1368,6 +1430,12 @@ static enum ggml_backend_dev_type ggml_backend_gcu_device_get_type(ggml_backend_
     return GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
+static ggml_backend_buffer_type_t ggml_backend_gcu_device_get_host_buffer_type(ggml_backend_dev_t dev) {
+    auto * buft = ggml_backend_gcu_host_buffer_type();
+    if (buft) buft->device = dev;
+    return buft;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_gcu_device_get_buffer_type(ggml_backend_dev_t dev) {
     auto * d = (ggml_backend_gcu_device_context *) dev->context;
     auto * buft = d->get_buft();
@@ -1569,7 +1637,7 @@ static const ggml_backend_device_i ggml_backend_gcu_device_i = {
     /* .get_props             = */ ggml_backend_gcu_device_get_props,
     /* .init_backend          = */ ggml_backend_gcu_device_init_backend,
     /* .get_buffer_type       = */ ggml_backend_gcu_device_get_buffer_type,
-    /* .get_host_buffer_type  = */ nullptr,
+    /* .get_host_buffer_type  = */ ggml_backend_gcu_device_get_host_buffer_type,
     /* .buffer_from_host_ptr  = */ nullptr,
     /* .supports_op           = */ ggml_backend_gcu_device_supports_op,
     /* .supports_buft         = */ ggml_backend_gcu_device_supports_buft,
