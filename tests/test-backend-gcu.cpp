@@ -459,6 +459,86 @@ static int test_mul_mat_mixed(ggml_backend_t gcu) {
     return 0;
 }
 
+// Numerical-equality test for the async H<->D path. Builds an
+// (a + b) * c chain on GCU; populates the inputs via
+// ggml_backend_tensor_set_async, runs graph_compute, reads back via
+// ggml_backend_tensor_get_async. Asserts the result matches the CPU
+// reference within F32 tolerance.
+static int test_async_overlap(ggml_backend_t gcu) {
+    const int64_t M = 512;
+    const int64_t N = 1024;
+    const size_t  n = (size_t) M * N;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * sum = ggml_add(ctx, a, b);
+    ggml_tensor * out = ggml_mul(ctx, sum, c);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) {
+        fprintf(stderr, "ASYNC_OVERLAP: failed to allocate tensors on GCU\n");
+        ggml_free(ctx);
+        return 1;
+    }
+
+    std::vector<float> ha(n), hb(n), hc(n), hout(n), expected(n);
+    fill_random_f32(ha.data(), n, 11);
+    fill_random_f32(hb.data(), n, 22);
+    fill_random_f32(hc.data(), n, 33);
+    for (size_t i = 0; i < n; i++) expected[i] = (ha[i] + hb[i]) * hc[i];
+
+    // Async H->D for all three inputs. Each call records last_copy_event
+    // on the copy stream; graph_compute waits on the latest recording.
+    ggml_backend_tensor_set_async(gcu, a, ha.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set_async(gcu, b, hb.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set_async(gcu, c, hc.data(), 0, n * sizeof(float));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    ggml_status s = ggml_backend_graph_compute(gcu, graph);
+    if (s != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ASYNC_OVERLAP: graph_compute returned %d\n", (int) s);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return 1;
+    }
+
+    // Async D->H — must wait on last_compute_event internally.
+    ggml_backend_tensor_get_async(gcu, out, hout.data(), 0, n * sizeof(float));
+    ggml_backend_synchronize(gcu);   // drain both streams before reading
+
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!close_enough(hout[i], expected[i], 1e-5f, 1e-5f)) {
+            if (bad < 4) {
+                fprintf(stderr, "ASYNC_OVERLAP: mismatch at %zu: got %f want %f\n",
+                        i, hout[i], expected[i]);
+            }
+            bad++;
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+
+    if (bad) {
+        fprintf(stderr, "ASYNC_OVERLAP: %d/%zu mismatched\n", bad, n);
+        return 1;
+    }
+    printf("ASYNC_OVERLAP: ok (%zu elements)\n", n);
+    return 0;
+}
+
 int main() {
     if (ggml_backend_gcu_get_device_count() < 1) {
         fprintf(stderr, "no GCU device found\n");
@@ -482,6 +562,7 @@ int main() {
     rc |= test_softmax(gcu);
     rc |= test_rope(gcu);
     rc |= test_mul_mat_mixed(gcu);
+    rc |= test_async_overlap(gcu);
 
     ggml_backend_free(gcu);
 
