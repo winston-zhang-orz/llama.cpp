@@ -550,6 +550,38 @@ Prompt processing speeds up cleanly on GCU once the batch is large enough to amo
 
 For Q4 weights with MVP-3a's dequant-on-load path, GCU runs Q4_K_M at ~31 t/s tg32 / ~309 t/s pp64 — improvement over MVP-2's Q4 GCU (25 / 273) but still below Q4 CPU baseline (70 / 463) because llama.cpp's CPU Q4 kernels are very well tuned and our F16 dequant doubles weight memory plus pays per-token H↔D for the KV cache. Hitting parity with Q4 CPU needs native quantized matmul (`topsatenLinearQuant`) and KV cache offload to GCU — both are tracked for follow-up MVPs.
 
+### Real-model verification
+
+Tested on the S60 against the current backend. All correctness checks pass; performance is model-size-dependent.
+
+**Output equivalence (greedy `--temp 0`)** — same first 16 tokens on both backends:
+
+| Model | CPU output | GCU output (`-nkvo`) | Match |
+|---|---|---|---|
+| Qwen 2.5 0.5B-Instruct F16 | "The capital of France is Paris." | "The capital of France is Paris." | ✓ |
+| Qwen 2.5 0.5B-Instruct Q4_K_M | "The capital of France is Paris." | "The capital of France is Paris." | ✓ |
+
+**F16 Qwen 0.5B at varied context lengths** (3 reps, GCU vs CPU):
+
+| | pp64 | pp128 | pp512 | pp1024 | pp2048 | tg64 | tg128 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| CPU | 388 | 468 | 463 | 364 | 321 | 30 | 30 |
+| GCU | 676 | 1481 | 1492 | 1073 | 787 | 36 | 35 |
+| Speedup | 1.74× | 3.17× | 3.22× | 2.95× | 2.45× | 1.20× | 1.18× |
+
+GCU prompt-processing wins at every tested length, peaking around pp128–512 (~3.2×) and degrading past pp1024 as the F16 KV cache crosses H↔D for every token (`-nkvo` keeps it CPU-resident). Generation is consistently 1.2× faster on GCU.
+
+**Partial offload** (`-ngl 12` of 24 layers): pp64 436 t/s — between CPU-only (388) and full-GCU (676), no crashes. Mixed CPU+GCU layer split works as expected.
+
+**Architecture coverage:** verified loading and running on Qwen 2 (Qwen 2.5 0.5B) and Llama (TinyLlama 15M Q4_0). Backend isn't Qwen-specific. For very small models like the 15M, CPU dominates because per-op GCU launch overhead exceeds the math savings — the GCU win starts mattering somewhere in the 100M–500M parameter range.
+
+**Recommended invocation for real models on GCU:**
+```sh
+./build/bin/llama-cli -m model.gguf --device GCU0 -nkvo -p "..." -n 64
+```
+
+Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tuned Q4 CPU kernels (see "Known SDK ceilings" below).
+
 ### Operator coverage (MVP-2)
 
 The following ops are implemented on GCU. Any op or shape outside these is automatically routed to CPU by ggml's scheduler:
