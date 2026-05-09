@@ -527,8 +527,11 @@ If the SDK is installed to a non-standard path, override with `-DTOPS_INSTALL_DI
 
 ```bash
 ./build/bin/llama-cli --list-devices         # GCU0 should appear with its memory size
-./build/bin/test-backend-gcu                 # smoke test: ADD + MUL_MAT vs CPU
+./build/bin/test-backend-gcu                 # smoke test: ADD + MUL_MAT + RMS_NORM + SOFT_MAX + ROPE + SILU + mixed-dtype MUL_MAT vs CPU
 ./build/bin/test-backend-ops -b GCU0 -o ADD  # exercises ADD across many shapes/dtypes
+
+# Real model (KV cache stays on CPU via -nkvo):
+./build/bin/llama-cli -m model.gguf --device GCU0 -nkvo -p "Hello" -n 16
 ```
 
 ### Operator coverage (MVP-2)
@@ -547,7 +550,7 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
 ### Known limitations (MVP-2)
 
 - Quantized weights (Q4_K, Q8_0, etc.) stay on CPU. Models load fine; compute on quantized tensors is CPU-bound.
-- KV cache is designed to stay on CPU. `SET_ROWS` to F16 destinations (the cache dtype) is refused on GCU. Real-model use with `--device GCU0` currently aborts at graph_reserve because llama.cpp pre-allocates the cache on the chosen device — an MVP-3 work item to plumb cache placement appropriately. Use `-ngl 0` to keep the backend loaded without offloading anything.
+- KV cache is designed to stay on CPU. `SET_ROWS` to F16 destinations (the cache dtype) is refused on GCU. Pass `-nkvo` (`--no-kv-offload`) when offloading layers to GCU; without it llama.cpp tries to allocate the cache on GCU and the scheduler aborts at graph_reserve. With `-nkvo`, real Q4 / F16 models load and run on `--device GCU0` (Q4 weights and KV stay CPU; activation math runs on GCU). Native cache offload is MVP-3+ work.
 - BF16 not supported.
 - Only `ROPE` mode 0 is implemented; YARN / NEOX / MROPE go to CPU. F16 ROPE is also CPU-only on this SDK version.
 - `SOFT_MAX` with `max_bias != 0` (alibi) and `softmax sinks` (a non-null `op->src[2]`) go to CPU.
