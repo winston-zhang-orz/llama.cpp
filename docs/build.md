@@ -670,7 +670,16 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 
   Set `GGML_GCU_NO_QUEUED_OPS=1` to revert each call site to the pre-MVP-4b sync-and-free pattern.
 
-  **Honest read of MVP-4b's payoff.** The token-generation uplift is large and real: +19–21 % on Llama 1B Q4_K_M and +54–61 % on Qwen 0.5B F16 — well outside session-to-session noise in both cases. This directly confirms that per-op `topsStreamSynchronize` host round-trips were the dominant tg bottleneck, not compute throughput itself. Prefill (pp512) gains are smaller (+4 % / +2 %) because its runtime is dominated by matrix multiply kernel time, not host-side dispatch overhead; the relative overhead of a per-op sync is diluted over longer per-op GPU work. The Qwen F16 tg uplift is larger than Llama Q4_K_M's because F16 decode ops are individually cheaper (less compute per op) so the fixed host-roundtrip cost is a larger fraction of total time. In practice MVP-4b brings GCU tg throughput from the ~28–34 t/s range (CPU-synchronized level) to the ~34–43 t/s range — a meaningful step, though absolute throughput is still gated by the S60's per-kernel launch latency at this scale.
+  Gemma 4 26B A4B (MoE, 25.23B total / 3.8B active per token, Q4_K_M, `--device GCU0 -nkvo 1`, r=2):
+
+  | test  | MVP-4b active       | MVP-4b disabled     | uplift  |
+  |-------|---------------------|---------------------|---------|
+  | tg16  | 7.65 ± 0.23 t/s     | 6.11 ± 0.04 t/s     | +25.2%  |
+  | pp64  | 35.68 ± 1.79 t/s    | 38.30 ± 2.24 t/s    | within noise |
+
+  This is the first MoE workload to validate against the new `MUL_MAT_ID` op and the queued-ops path together. The tg uplift (+25%) is meaningful: the per-token compute amortizes launch overhead more than a pure dense decode would, so the MVP-4b benefit is bounded but real. pp64 difference is within the stddev band (single run pair); a longer r=5 sweep would tighten the prefill comparison.
+
+  **Honest read of MVP-4b's payoff.** The token-generation uplift is large and real: +19–21 % on Llama 1B Q4_K_M, +54–61 % on Qwen 0.5B F16, and +25 % on Gemma 4 26B A4B — well outside session-to-session noise in all three. This directly confirms that per-op `topsStreamSynchronize` host round-trips were the dominant tg bottleneck, not compute throughput itself. Prefill (pp512) gains are smaller (+4 % / +2 %) because its runtime is dominated by matrix multiply kernel time, not host-side dispatch overhead; the relative overhead of a per-op sync is diluted over longer per-op GPU work. The Qwen F16 tg uplift is larger than Llama Q4_K_M's because F16 decode ops are individually cheaper (less compute per op) so the fixed host-roundtrip cost is a larger fraction of total time. In practice MVP-4b brings GCU tg throughput from the ~28–34 t/s range (CPU-synchronized level) to the ~34–43 t/s range — a meaningful step, though absolute throughput is still gated by the S60's per-kernel launch latency at this scale.
 
 ### Known SDK ceilings (per-topsaten investigation)
 
