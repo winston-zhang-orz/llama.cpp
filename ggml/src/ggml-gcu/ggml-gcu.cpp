@@ -1540,8 +1540,14 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     void * cs_dev  = ctx->pool.alloc(cs_bytes);
     void * pos_dev = ctx->pool.alloc(pos_bytes);
 
+    // Host-side staging buffers must outlive the async memcpy. topsrt's
+    // pageable-host->device path normally stages the bytes synchronously
+    // at memcpyAsync call time, but we keep these vectors at function
+    // scope so any future implementation change (e.g. true async DMA)
+    // doesn't silently reintroduce a use-after-free.
+    std::vector<ggml_fp16_t> cs_f16;
     if (cs_is_f16) {
-        std::vector<ggml_fp16_t> cs_f16(cs_host.size());
+        cs_f16.resize(cs_host.size());
         ggml_fp32_to_fp16_row(cs_host.data(), cs_f16.data(), (int64_t) cs_host.size());
         TOPS_CHECK(topsMemcpyAsync(cs_dev, cs_f16.data(), cs_bytes,
                                    topsMemcpyHostToDevice, ctx->compute_stream));
@@ -1553,6 +1559,12 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     for (int64_t i = 0; i < n_tokens; i++) pos_i64[i] = (int64_t) pos_host[i];
     TOPS_CHECK(topsMemcpyAsync(pos_dev, pos_i64.data(), pos_bytes,
                                topsMemcpyHostToDevice, ctx->compute_stream));
+    // Synchronize before the kernel: the H->D copies above use std::vector
+    // sources whose lifetime ends when this function returns. With MVP-4b
+    // there is no per-op synchronize, so the kernel may run after the
+    // function returns. A targeted stream sync here drains the copies
+    // before the kernel queues any reads from cs_dev / pos_dev.
+    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
 
     // topsvllmRotaryEmbedding rotates query in-place. For ggml's non-inplace
     // ROPE (dst is a fresh tensor distinct from x), copy x into dst first so
