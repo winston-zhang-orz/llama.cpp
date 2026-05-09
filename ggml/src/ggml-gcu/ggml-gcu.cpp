@@ -209,7 +209,17 @@ struct ggml_backend_gcu_context {
     bool         copy_event_armed   = false;
     bool         compute_event_armed = false;
 
+    // MVP-4b: scratch frees deferred to end of graph_compute so kernels
+    // queue without per-op host synchronize and the next op's pool.alloc
+    // can't reuse a buffer the previous op's kernel is still reading.
+    std::vector<std::pair<void *, size_t>> deferred_frees;
+
+    void defer_free(void * p, size_t sz) {
+        if (p) deferred_frees.emplace_back(p, sz);
+    }
+
     explicit ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
+        deferred_frees.reserve(64);
         TOPS_CHECK(topsSetDevice(device));
         gcu_global_init_inc();
         TOPS_CHECK(topsStreamCreate(&compute_stream));
@@ -512,30 +522,38 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
     auto * ctx = (ggml_backend_gcu_context *) backend->context;
     TOPS_CHECK(topsSetDevice(ctx->device));
 
-    // Stitch any pending async H->D copies onto the compute stream.
     if (ctx->copy_event_armed) {
         TOPS_CHECK(topsStreamWaitEvent(ctx->compute_stream,
                                        ctx->last_copy_event, 0));
         ctx->copy_event_armed = false;
     }
 
+    ggml_status status = GGML_STATUS_SUCCESS;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_is_empty(node) || node->op == GGML_OP_NONE) continue;
         if (!gcu_compute_node(ctx, node)) {
             GGML_LOG_ERROR("%s: op %s not implemented or failed\n",
                            __func__, ggml_op_name(node->op));
-            return GGML_STATUS_FAILED;
+            status = GGML_STATUS_FAILED;
+            break;
         }
     }
 
-    // Arm the compute event so subsequent get_tensor_async can wait on
-    // it without blocking the host.
     TOPS_CHECK(topsEventRecord(ctx->last_compute_event, ctx->compute_stream));
     ctx->compute_event_armed = true;
-
     TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
-    return GGML_STATUS_SUCCESS;
+
+    // MVP-4b: drain deferred frees on every exit path. Kernels submitted
+    // before the failure must complete (ensured by the synchronize above)
+    // and their scratch buffers must return to the pool, otherwise the
+    // pool grows monotonically across calls under failure recovery.
+    for (auto & kv : ctx->deferred_frees) {
+        ctx->pool.free(kv.first, kv.second);
+    }
+    ctx->deferred_frees.clear();
+
+    return status;
 }
 
 // Mirrors ggml_backend_buffer_is_cuda: detect a GCU device buffer by
@@ -554,6 +572,28 @@ static bool ggml_backend_buffer_is_gcu(ggml_backend_buffer_t buffer) {
 static bool gcu_async_disabled() {
     static const bool disabled = (getenv("GGML_GCU_NO_ASYNC_COPY") != nullptr);
     return disabled;
+}
+
+// MVP-4b: when set, op handlers keep their pre-MVP-4b sync-and-free
+// pattern (per-op topsStreamSynchronize + immediate pool.free). Used for
+// bisection if a real model regresses with queued ops.
+static bool gcu_queued_ops_disabled() {
+    static const bool disabled = (getenv("GGML_GCU_NO_QUEUED_OPS") != nullptr);
+    return disabled;
+}
+
+// MVP-4b: replaces every `topsStreamSynchronize + pool.free` pair inside op
+// handlers. Defers the free to graph_compute's end-of-batch drain unless
+// GGML_GCU_NO_QUEUED_OPS=1, in which case we restore the pre-MVP-4b
+// behavior (synchronize then immediate free).
+static void gcu_release_scratch(ggml_backend_gcu_context * ctx, void * p, size_t sz) {
+    if (!p) return;
+    if (gcu_queued_ops_disabled()) {
+        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
+        ctx->pool.free(p, sz);
+    } else {
+        ctx->defer_free(p, sz);
+    }
 }
 
 static void ggml_backend_gcu_set_tensor_async(
@@ -777,12 +817,7 @@ static bool gcu_op_add(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         TOPSATEN_CHECK(topsatenAdd(out, lhs, rhs, alpha, ctx->compute_stream));
     }
 
-    if (scratch) {
-        // Synchronize before returning the scratch to the pool: the op is
-        // queued on the stream and reading from scratch must complete.
-        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
-        ctx->pool.free(scratch, scratch_bytes);
-    }
+    gcu_release_scratch(ctx, scratch, scratch_bytes);
     return true;
 }
 
@@ -819,10 +854,7 @@ static bool gcu_op_mul(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         TOPSATEN_CHECK(topsatenMul(out, lhs, rhs, ctx->compute_stream));
     }
 
-    if (scratch) {
-        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
-        ctx->pool.free(scratch, scratch_bytes);
-    }
+    gcu_release_scratch(ctx, scratch, scratch_bytes);
     return true;
 }
 
@@ -865,10 +897,7 @@ static bool gcu_op_scale(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         TOPSATEN_CHECK(topsatenMul(out, lhs, s, ctx->compute_stream));
     }
 
-    if (scratch) {
-        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
-        ctx->pool.free(scratch, scratch_bytes);
-    }
+    gcu_release_scratch(ctx, scratch, scratch_bytes);
     return true;
 }
 
@@ -965,10 +994,7 @@ static bool gcu_op_rms_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 
     TOPSATEN_CHECK(topsvllmRmsNorm(out_t, in_t, gamma_t, eps_s, ctx->compute_stream));
 
-    if (cast_buf) {
-        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
-        ctx->pool.free(cast_buf, cast_bytes);
-    }
+    gcu_release_scratch(ctx, cast_buf, cast_bytes);
     return true;
 }
 
@@ -1110,9 +1136,8 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
                                    topsMemcpyDeviceToDevice, ctx->compute_stream));
     }
 
-    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
-    if (x_cast) ctx->pool.free(x_cast, x_cast_bytes);
-    ctx->pool.free(y_f16, y_f16_bytes);
+    gcu_release_scratch(ctx, x_cast, x_cast_bytes);
+    gcu_release_scratch(ctx, y_f16, y_f16_bytes);
     return true;
 }
 
@@ -1221,10 +1246,7 @@ static bool gcu_op_set_rows(ggml_backend_gcu_context * ctx, ggml_tensor * node) 
                                    topsMemcpyDeviceToDevice, ctx->compute_stream));
     }
 
-    if (cast_buf) {
-        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
-        ctx->pool.free(cast_buf, cast_bytes);
-    }
+    gcu_release_scratch(ctx, cast_buf, cast_bytes);
     return true;
 }
 
@@ -1384,10 +1406,9 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
                                            (int) head_dim, /*is_neox=*/false,
                                            ctx->compute_stream));
 
-    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
-    ctx->pool.free(cs_dev,        cs_bytes);
-    ctx->pool.free(pos_dev,       pos_bytes);
-    ctx->pool.free(dummy_key_dev, dummy_bytes);
+    gcu_release_scratch(ctx, cs_dev,        cs_bytes);
+    gcu_release_scratch(ctx, pos_dev,       pos_bytes);
+    gcu_release_scratch(ctx, dummy_key_dev, dummy_bytes);
     return true;
 }
 
@@ -1439,8 +1460,7 @@ static bool gcu_op_soft_max(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     int rank = ggml_n_dims(dst); if (rank < 1) rank = 1;
     TOPSATEN_CHECK(topsatenSoftmaxForward(out_t, scratch_t, rank - 1, ctx->compute_stream));
 
-    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
-    ctx->pool.free(scratch, bytes);
+    gcu_release_scratch(ctx, scratch, bytes);
     return true;
 }
 
