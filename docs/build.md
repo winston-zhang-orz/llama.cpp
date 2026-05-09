@@ -557,7 +557,7 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
 - Element-wise: `ADD`, `MUL`, `SCALE` (bias = 0 only)
 - Activations: `SILU`
 - Normalization: `RMS_NORM`
-- Position encoding: `ROPE` (mode 0 only — no NEOX, no YARN, no MROPE; F32 only)
+- Position encoding: `ROPE` (mode 0 only — no NEOX, no YARN, no MROPE; F32 and F16)
 - Reduction: `SOFT_MAX` (with optional mask, `max_bias = 0`, no softmax sinks)
 - Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast; Q4_0 / Q8_0 / Q4_K weights via F16 dequant-on-load)
 - Indexing: `GET_ROWS` (F32 only, unbatched), `SET_ROWS` (F32 dst only — KV cache stays on CPU)
@@ -568,7 +568,7 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
 - Q4_0, Q8_0, and Q4_K weight tensors are dequantized to F16 at model-load time (one-time host cost) and stored as F16 on GCU (2-4× the on-disk size). MUL_MAT then runs on GCU via the F16 path. Other Q-types (Q5_K, Q6_K, Q3_K, etc.) stay on CPU. Native quantized matmul via `topsatenLinearQuant` is a future MVP that would avoid the F16 expansion and likely match Q4 CPU performance.
 - KV cache is designed to stay on CPU. `SET_ROWS` to F16 destinations (the cache dtype) is refused on GCU. Pass `-nkvo` (`--no-kv-offload`) when offloading layers to GCU; without it llama.cpp tries to allocate the cache on GCU and the scheduler aborts at graph_reserve. With `-nkvo`, real Q4 / F16 models load and run on `--device GCU0` (Q4 weights and KV stay CPU; activation math runs on GCU). An MVP-3b probe (manual D2D memcpy bypassing `topsatenIndexPut`) was 2-5× slower than `-nkvo` because per-call sync H2D of indices drains the stream — native cache offload needs an async index transfer or a custom GCU scatter kernel.
 - BF16 not supported.
-- Only `ROPE` mode 0 is implemented; YARN / NEOX / MROPE go to CPU. F16 ROPE is also CPU-only on this SDK version.
+- Only `ROPE` mode 0 is implemented; YARN / NEOX / MROPE go to CPU.
 - `SOFT_MAX` with `max_bias != 0` (alibi) and `softmax sinks` (a non-null `op->src[2]`) go to CPU.
 - Single device, single stream, no pinned host memory. Multi-device, async overlap, native quantized matmul are MVP-3+ work.
 
