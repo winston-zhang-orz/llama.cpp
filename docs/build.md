@@ -572,6 +572,16 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
 - `SOFT_MAX` with `max_bias != 0` (alibi) and `softmax sinks` (a non-null `op->src[2]`) go to CPU.
 - Single device, single stream, no pinned host memory. Multi-device, async overlap, native quantized matmul are MVP-3+ work.
 
+### Known SDK ceilings (per-topsaten investigation)
+
+A few proposed perf improvements were explored against the topsop SDK source (`/Users/root1/gitlab/topsop`) and turned out to require GCU device-kernel work (writing `.tops` code), not just topsaten/topsrt API wiring. Documenting here so future contributors don't re-investigate:
+
+- **Native quantized MUL_MAT** via `topsatenLinearQuant`: blocked by format mismatch. The op only accepts **int8** weights with group_size of −1, 64, or 128; ggml stores Q4_0/Q4_K as **4-bit** with block_size 32 (Q4_0) or 256-element super-blocks (Q4_K). Bridging the two needs either offline re-quantization to a topsaten-friendly layout (changes GGUF file format) or a custom `.tops` kernel that consumes ggml's packed nibble layout directly. Source check: `op_aten_linearquant.h:132-220`.
+- **Native KV cache offload (F16 SET_ROWS)** via `topsatenIndexPut`: rejected at runtime for the actual cache shape. Manual D2D memcpy bypass works correctness-wise but per-call sync H2D of indices serialized the layer pipeline and ran 2-5× slower than `-nkvo`. A real win needs a custom `.tops` scatter kernel or asynchronous batched indexing.
+- **Block-paged KV cache** via `topsvllmReshapeAndCache`: requires the vLLM `[num_blocks, block_size, num_heads, head_size]` layout. ggml uses a flat contiguous cache; switching would mean rewriting llama.cpp's KV management — out of scope for this backend.
+
+The current MVP-2/3a/3c state appears to be the practical ceiling on this SDK without writing GCU device kernels. Further perf gains are real but require a different class of work (`.tops` device code) than this backend takes on.
+
 ## ZenDNN
 
 ZenDNN provides optimized deep learning primitives for AMD EPYC™ CPUs. It accelerates matrix multiplication operations for inference workloads.
