@@ -76,9 +76,12 @@ static const char * topsaten_status_to_str(topsatenStatus_t s) {
         }                                                                           \
     } while (0)
 
-// Forward declaration: defined in the tensor-mapping section, used
-// earlier in the buffer-type code (init_tensor + get_alloc_size).
+// Forward declarations: defined in the tensor-mapping section, used
+// earlier in the buffer-type code (init_tensor / get_alloc_size /
+// set_tensor).
 static bool gcu_q_supported(ggml_type t);
+static void gcu_q_dequantize_to_f32(ggml_type type, const void * src,
+                                    float * dst, int64_t n_elem);
 
 // === Process-level topsaten init refcount ===========================
 //
@@ -282,6 +285,29 @@ static void ggml_backend_gcu_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                const void * data, size_t offset, size_t size) {
     auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
     TOPS_CHECK(topsSetDevice(bctx->ctx->device));
+
+    // MVP-3a: Q-typed full-tensor uploads are dequantized to F16 on host
+    // before transfer. Q packing is per-row (and per super-block for
+    // Q4_K) so partial writes don't translate cleanly; ggml's model
+    // loader uses full-tensor writes for weights, which is what we
+    // assert here.
+    if (gcu_q_supported(tensor->type)) {
+        GGML_ASSERT(offset == 0);
+        const int64_t n_elem    = ggml_nelements(tensor);
+        const size_t  expect_sz = ggml_row_size(tensor->type, n_elem);
+        GGML_ASSERT(size == expect_sz);
+
+        std::vector<float>       host_f32(n_elem);
+        std::vector<ggml_fp16_t> host_f16(n_elem);
+        gcu_q_dequantize_to_f32(tensor->type, data, host_f32.data(), n_elem);
+        ggml_fp32_to_fp16_row(host_f32.data(), host_f16.data(), n_elem);
+
+        TOPS_CHECK(topsMemcpy(tensor->data, host_f16.data(),
+                              (size_t) n_elem * sizeof(ggml_fp16_t),
+                              topsMemcpyHostToDevice));
+        return;
+    }
+
     TOPS_CHECK(topsMemcpy((char *) tensor->data + offset, data, size, topsMemcpyHostToDevice));
 }
 
