@@ -910,9 +910,7 @@ static bool gcu_op_scale(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 // so no extra synchronization is needed between resize and use.
 static void * gcu_get_zero_bias(ggml_backend_gcu_context * ctx, size_t n_bytes) {
     if (ctx->zero_bias_bytes < n_bytes) {
-        if (ctx->zero_bias) {
-            ctx->pool.free(ctx->zero_bias, ctx->zero_bias_bytes);
-        }
+        gcu_release_scratch(ctx, ctx->zero_bias, ctx->zero_bias_bytes);
         ctx->zero_bias       = ctx->pool.alloc(n_bytes);
         ctx->zero_bias_bytes = n_bytes;
         TOPS_CHECK(topsMemsetAsync(ctx->zero_bias, 0, n_bytes, ctx->compute_stream));
@@ -924,9 +922,7 @@ static void * gcu_get_zero_bias(ggml_backend_gcu_context * ctx, size_t n_bytes) 
 // Grows on demand. Always F32; callers cast to other dtypes via topsatenTo.
 static void * gcu_get_ones_f32(ggml_backend_gcu_context * ctx, int64_t count) {
     if (ctx->ones_n0_count >= count) return ctx->ones_n0;
-    if (ctx->ones_n0) {
-        ctx->pool.free(ctx->ones_n0, ctx->ones_n0_bytes);
-    }
+    gcu_release_scratch(ctx, ctx->ones_n0, ctx->ones_n0_bytes);
     const size_t bytes = (size_t) count * sizeof(float);
     ctx->ones_n0       = ctx->pool.alloc(bytes);
     ctx->ones_n0_bytes = bytes;
