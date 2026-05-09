@@ -1422,6 +1422,122 @@ static bool gcu_op_mul_mat_id(ggml_backend_gcu_context * ctx, ggml_tensor * dst)
     return true;
 }
 
+// GLU (gated linear unit). dst = activation(gate) * up, element-wise.
+//
+//   GEGLU:  activation = GELU
+//   SWIGLU: activation = SILU
+//   REGLU:  activation = RELU
+//
+// Two source forms (per ggml_glu_impl):
+//   - Two-source: src[0]=a, src[1]=b, same shape, dst shape = a shape.
+//                 gate=a, up=b (or swapped via op_params[1]).
+//   - Split:      src[1]=null, src[0] has 2*n in dim 0, dst has n in dim 0.
+//                 Halves of src[0] are gate (offset 0) and up (offset n).
+//                 swapped flips which half is gate.
+//
+// Implementation: one activation kernel into a scratch the size of dst,
+// then one element-wise topsatenMul into dst. The split form passes
+// non-contiguous half-views (stride 2*n in dim-0 of the original tensor)
+// to the activation kernel; topsaten handles the strided source.
+static bool gcu_op_glu(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src0 = dst->src[0];
+    ggml_tensor * src1 = dst->src[1];
+
+    const int32_t glu_op = ((const int32_t *) dst->op_params)[0];
+    const bool    swapped = ((const int32_t *) dst->op_params)[1] != 0;
+
+    const ggml_type t = src0->type;
+    const size_t    bpe = ggml_type_size(t);
+
+    // Scratch holds the activation output, same shape as dst.
+    const size_t scratch_bytes = ggml_nbytes(dst);
+    void * scratch = ctx->pool.alloc(scratch_bytes);
+
+    // Build outer-first dims for dst (same shape as gate/up after split).
+    int rank = ggml_n_dims(dst);
+    if (rank < 1) rank = 1;
+    int64_t out_dims[GGML_MAX_DIMS];
+    int64_t out_strs_contig[GGML_MAX_DIMS];
+    for (int i = 0; i < rank; i++) {
+        out_dims[i] = dst->ne[rank - 1 - i];
+    }
+    out_strs_contig[rank - 1] = 1;
+    for (int i = rank - 2; i >= 0; i--) {
+        out_strs_contig[i] = out_strs_contig[i + 1] * out_dims[i + 1];
+    }
+
+    // Source view builders. For the two-source form, gate/up are full
+    // tensors; for split, we build views with the same shape as dst but
+    // the original tensor's strides (so dim-0 step skips the other half).
+    void * gate_data = nullptr;
+    void * up_data   = nullptr;
+    int64_t src_dims[GGML_MAX_DIMS];
+    int64_t src_strs[GGML_MAX_DIMS];
+
+    if (src1 != nullptr) {
+        // Two-source: same shape as dst, normal strides.
+        ggml_tensor * gate_t = swapped ? src1 : src0;
+        ggml_tensor * up_t   = swapped ? src0 : src1;
+        for (int i = 0; i < rank; i++) {
+            src_dims[i] = gate_t->ne[rank - 1 - i];
+            src_strs[i] = (int64_t) (gate_t->nb[rank - 1 - i] / bpe);
+        }
+        gate_data = gate_t->data;
+        up_data   = up_t->data;
+    } else {
+        // Split form. Halves are non-contiguous views of src0.
+        const int64_t n_half = src0->ne[0] / 2;
+        const size_t  gate_off = swapped ? (size_t) n_half * bpe : 0;
+        const size_t  up_off   = swapped ? 0 : (size_t) n_half * bpe;
+        for (int i = 0; i < rank; i++) {
+            const int gd = rank - 1 - i;
+            src_dims[i] = (gd == 0) ? n_half : src0->ne[gd];
+            src_strs[i] = (int64_t) (src0->nb[gd] / bpe);
+        }
+        gate_data = (char *) src0->data + gate_off;
+        up_data   = (char *) src0->data + up_off;
+    }
+
+    topsatenDataType_t dtype = ggml_to_topsaten_dtype(t);
+    topsatenTensor gate(topsatenSize_t(src_dims, rank), topsatenSize_t(src_strs, rank),
+                        dtype, gate_data);
+    topsatenTensor up  (topsatenSize_t(src_dims, rank), topsatenSize_t(src_strs, rank),
+                        dtype, up_data);
+    // scratch and dst are contiguous with dst shape.
+    topsatenTensor scratch_t(topsatenSize_t(out_dims, rank), topsatenSize_t(out_strs_contig, rank),
+                             dtype, scratch);
+    int64_t dst_strs[GGML_MAX_DIMS];
+    for (int i = 0; i < rank; i++) {
+        dst_strs[i] = (int64_t) (dst->nb[rank - 1 - i] / bpe);
+    }
+    topsatenTensor dst_t(topsatenSize_t(out_dims, rank), topsatenSize_t(dst_strs, rank),
+                         dtype, dst->data);
+
+    switch (glu_op) {
+        case GGML_GLU_OP_GEGLU:
+            TOPSATEN_CHECK(topsatenGelu(scratch_t, gate, "none", ctx->compute_stream));
+            break;
+        case GGML_GLU_OP_GEGLU_QUICK:
+            TOPSATEN_CHECK(topsatenGelu(scratch_t, gate, "tanh", ctx->compute_stream));
+            break;
+        case GGML_GLU_OP_SWIGLU:
+            TOPSATEN_CHECK(topsatenSilu(scratch_t, gate, ctx->compute_stream));
+            break;
+        case GGML_GLU_OP_REGLU:
+            TOPSATEN_CHECK(topsatenRelu(scratch_t, gate, ctx->compute_stream));
+            break;
+        default:
+            // Unknown / unsupported GLU op type — caller should have
+            // gated supports_op accordingly.
+            gcu_release_scratch(ctx, scratch, scratch_bytes);
+            return false;
+    }
+
+    TOPSATEN_CHECK(topsatenMul(dst_t, scratch_t, up, ctx->compute_stream));
+    gcu_release_scratch(ctx, scratch, scratch_bytes);
+    return true;
+}
+
 // CPY/DUP/CONT. Same dtype + contiguous → fast topsMemcpyAsync(D2D).
 // Different dtype (F32↔F16, both contiguous) → topsatenTo cast.
 static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
@@ -1878,6 +1994,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_rms_norm(ctx, node);
         case GGML_OP_ROPE:
             return gcu_op_rope(ctx, node);
+        case GGML_OP_GLU:
+            return gcu_op_glu(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -2178,6 +2296,38 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_GLU: {
+            // GEGLU / GEGLU_QUICK / SWIGLU / REGLU. Two-source or split.
+            const ggml_tensor * a = op->src[0];
+            const ggml_tensor * b = op->src[1];
+            if (!a) return false;
+            if (!gcu_dtype_supported(a->type)) return false;
+            if (a->type != op->type) return false;
+            if (b && (b->type != a->type)) return false;
+            // Split form: src[0] must have ne[0] == 2 * dst->ne[0].
+            if (!b && a->ne[0] != 2 * op->ne[0]) return false;
+            // Two-source form: src[0] and src[1] same shape as dst.
+            if (b && (a->ne[0] != op->ne[0] || b->ne[0] != op->ne[0])) return false;
+            // Contiguity: dst must be fully contiguous; sources need only
+            // be contiguous in dim 0 (matches ggml_glu_impl's own assert).
+            // The MoE FFN path passes strided views of a fused gate_up
+            // tensor whose nb[1] != ne[0]*type_size — gcu_op_glu picks
+            // up the original strides from src->nb[].
+            if (!ggml_is_contiguous(op)) return false;
+            if (!ggml_is_contiguous_1(a)) return false;
+            if (b && !ggml_is_contiguous_1(b)) return false;
+            const int32_t glu_op = ((const int32_t *) op->op_params)[0];
+            switch (glu_op) {
+                case GGML_GLU_OP_GEGLU:
+                case GGML_GLU_OP_GEGLU_QUICK:
+                case GGML_GLU_OP_SWIGLU:
+                case GGML_GLU_OP_REGLU:
+                    break;
+                default:
+                    return false;
+            }
             return true;
         }
         case GGML_OP_CONCAT: {

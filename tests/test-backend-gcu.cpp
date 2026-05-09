@@ -588,6 +588,137 @@ static int test_mul_mat_mixed(ggml_backend_t gcu) {
     return 0;
 }
 
+// GLU smoke. Two-source form with GEGLU and SWIGLU. Split form with
+// GEGLU. All on F32 with shapes that mirror an FFN gate*up step.
+static int test_glu_split(ggml_backend_t gcu, ggml_glu_op op, const char * label, int seed) {
+    const int64_t n_ff = 256, n_tokens = 32;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    // Single-source split: input has 2*n_ff in dim 0.
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * n_ff, n_tokens);
+    ggml_tensor * c = ggml_glu(ctx, a, op, /*swapped=*/false);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "%s: alloc failed\n", label); ggml_free(ctx); return 1; }
+
+    const size_t na = (size_t)(2 * n_ff) * (size_t) n_tokens;
+    const size_t nc = (size_t) n_ff * (size_t) n_tokens;
+    std::vector<float> ha(na), hc(nc), expected(nc);
+    fill_random_f32(ha.data(), na, (uint32_t) seed);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        const float * row = ha.data() + (size_t) t * (2 * n_ff);
+        for (int64_t i = 0; i < n_ff; i++) {
+            const float gate = row[i];
+            const float up   = row[n_ff + i];
+            float act = 0.0f;
+            switch (op) {
+                case GGML_GLU_OP_GEGLU:
+                    act = 0.5f * gate * (1.0f + std::erf(gate / std::sqrt(2.0f)));
+                    break;
+                case GGML_GLU_OP_SWIGLU:
+                    act = gate * (1.0f / (1.0f + std::exp(-gate)));
+                    break;
+                case GGML_GLU_OP_REGLU:
+                    act = gate > 0.0f ? gate : 0.0f;
+                    break;
+                default:
+                    fprintf(stderr, "%s: unsupported op in test\n", label);
+                    ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+            }
+            expected[(size_t) t * n_ff + i] = act * up;
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, na * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: compute failed\n", label);
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, nc * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < nc; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 1e-4f, 1e-4f)) {
+            if (bad < 5) fprintf(stderr, "%s: mismatch idx=%zu got=%f want=%f\n",
+                                 label, i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "%s: %d mismatches (max_abs_err=%f)\n", label, bad, max_err); return 1; }
+    printf("%s: ok (%zu elements, max_abs_err=%f)\n", label, nc, max_err);
+    return 0;
+}
+
+static int test_geglu_split(ggml_backend_t gcu)  { return test_glu_split(gcu, GGML_GLU_OP_GEGLU,  "GEGLU_SPLIT",  511); }
+static int test_swiglu_split(ggml_backend_t gcu) { return test_glu_split(gcu, GGML_GLU_OP_SWIGLU, "SWIGLU_SPLIT", 512); }
+static int test_reglu_split(ggml_backend_t gcu)  { return test_glu_split(gcu, GGML_GLU_OP_REGLU,  "REGLU_SPLIT",  513); }
+
+// Two-source GLU: src[0]=gate, src[1]=up, both same shape, output same shape.
+static int test_geglu_two(ggml_backend_t gcu) {
+    const int64_t n_ff = 256, n_tokens = 32;
+    const size_t  n = (size_t) n_ff * (size_t) n_tokens;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_tokens);
+    ggml_tensor * up   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n_tokens);
+    ggml_tensor * c    = ggml_geglu_split(ctx, gate, up);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "GEGLU_TWO: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> hg(n), hu(n), hc(n), expected(n);
+    fill_random_f32(hg.data(), n, 521);
+    fill_random_f32(hu.data(), n, 522);
+    for (size_t i = 0; i < n; i++) {
+        const float g = hg[i];
+        const float gelu = 0.5f * g * (1.0f + std::erf(g / std::sqrt(2.0f)));
+        expected[i] = gelu * hu[i];
+    }
+
+    ggml_backend_tensor_set(gate, hg.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(up,   hu.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "GEGLU_TWO: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 1e-4f, 1e-4f)) {
+            if (bad < 5) fprintf(stderr, "GEGLU_TWO: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "GEGLU_TWO: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("GEGLU_TWO: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
 // === MVP-5a unary activations ===========================================
 //
 // Shared smoke harness for the new GGML_OP_UNARY ops added in MVP-5a.
@@ -2282,6 +2413,10 @@ int main() {
     rc |= test_sigmoid(gcu);
     rc |= test_hardswish(gcu);
     rc |= test_hardsigmoid(gcu);
+    rc |= test_geglu_split(gcu);
+    rc |= test_swiglu_split(gcu);
+    rc |= test_reglu_split(gcu);
+    rc |= test_geglu_two(gcu);
     rc |= test_norm(gcu);
     rc |= test_norm_f16(gcu);
     rc |= test_rms_norm(gcu);
