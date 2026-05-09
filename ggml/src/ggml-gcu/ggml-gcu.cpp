@@ -188,8 +188,8 @@ struct ggml_backend_gcu_context {
     // Per-context zero-filled scratch used as bias for topsatenLinear's
     // mandatory bias parameter. Grows on demand to the largest output row
     // count seen so far, in F32 (largest dtype we use), and reinterpreted
-    // for F16 calls. Protected by the same single stream as compute, so
-    // no lock is needed.
+    // for F16 calls. Only ever flows through compute_stream, so no lock
+    // is needed.
     void *  zero_bias       = nullptr;
     size_t  zero_bias_bytes = 0;
 
@@ -212,8 +212,8 @@ struct ggml_backend_gcu_context {
         gcu_global_init_inc();
         TOPS_CHECK(topsStreamCreate(&compute_stream));
         TOPS_CHECK(topsStreamCreate(&copy_stream));
-        TOPS_CHECK(topsEventCreate(&last_copy_event));
-        TOPS_CHECK(topsEventCreate(&last_compute_event));
+        TOPS_CHECK(topsEventCreateWithFlags(&last_copy_event,    topsEventDisableTiming));
+        TOPS_CHECK(topsEventCreateWithFlags(&last_compute_event, topsEventDisableTiming));
 
         char buf[GGML_GCU_NAME_MAX];
         snprintf(buf, sizeof(buf), "GCU%d", device);
