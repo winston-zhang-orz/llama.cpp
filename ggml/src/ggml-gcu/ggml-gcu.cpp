@@ -498,6 +498,9 @@ static void ggml_backend_gcu_free(ggml_backend_t backend) {
 
 static void ggml_backend_gcu_synchronize(ggml_backend_t backend) {
     auto * ctx = (ggml_backend_gcu_context *) backend->context;
+    // Copy first so any pending D->H drains into host memory the caller
+    // may inspect; compute second.
+    TOPS_CHECK(topsStreamSynchronize(ctx->copy_stream));
     TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
 }
 
@@ -509,6 +512,13 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
     auto * ctx = (ggml_backend_gcu_context *) backend->context;
     TOPS_CHECK(topsSetDevice(ctx->device));
 
+    // Stitch any pending async H->D copies onto the compute stream.
+    if (ctx->copy_event_armed) {
+        TOPS_CHECK(topsStreamWaitEvent(ctx->compute_stream,
+                                       ctx->last_copy_event, 0));
+        ctx->copy_event_armed = false;
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_is_empty(node) || node->op == GGML_OP_NONE) continue;
@@ -518,6 +528,12 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
             return GGML_STATUS_FAILED;
         }
     }
+
+    // Arm the compute event so subsequent get_tensor_async can wait on
+    // it without blocking the host.
+    TOPS_CHECK(topsEventRecord(ctx->last_compute_event, ctx->compute_stream));
+    ctx->compute_event_armed = true;
+
     TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
     return GGML_STATUS_SUCCESS;
 }
