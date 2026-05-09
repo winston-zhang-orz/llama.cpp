@@ -603,7 +603,7 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 
 ### Operator coverage (MVP-2)
 
-The following ops are implemented on GCU. Any op or shape outside these is automatically routed to CPU by ggml's scheduler:
+**18 ops dispatched / 11 distinct kernels** (the 4 view ops are zero-copy and 3 of `CPY`/`DUP`/`CONT` share one handler). Any op or shape outside these is automatically routed to CPU by ggml's scheduler:
 
 - Element-wise: `ADD`, `MUL`, `SCALE` (bias = 0 only)
 - Activations: `SILU`
