@@ -701,9 +701,16 @@ static bool gcu_op_rms_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     topsatenTensor gamma_t(topsatenSize_t(gamma_d, 1), topsatenSize_t(gamma_s, 1),
                            gamma_dtype, gamma_data);
 
-    gcu_tensor_dims d_dst, d_src;
-    topsatenTensor out_t = make_topsaten_tensor(dst, d_dst);
-    topsatenTensor in_t  = make_topsaten_tensor(src, d_src);
+    // topsteRmsNormFwd requires input rank in [2, 4]. ggml's RMS_NORM is
+    // applied along the innermost dim, with shape [hidden_size, n_rows, 1, 1]
+    // typically — collapse the outer dims into one and present as rank 2.
+    const int64_t n_rows = src->ne[1] * src->ne[2] * src->ne[3];
+    int64_t io_d[2] = { n_rows, hidden_size };
+    int64_t io_s[2] = { hidden_size, 1 };
+    topsatenTensor in_t (topsatenSize_t(io_d, 2), topsatenSize_t(io_s, 2),
+                         ggml_to_topsaten_dtype(src->type), src->data);
+    topsatenTensor out_t(topsatenSize_t(io_d, 2), topsatenSize_t(io_s, 2),
+                         ggml_to_topsaten_dtype(dst->type), dst->data);
 
     topsatenScalar_t eps_s; eps_s.dtype = TOPSATEN_DATA_FP32; eps_s.fval = eps;
 
