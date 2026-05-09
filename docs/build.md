@@ -651,6 +651,26 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
 
   **Honest read of MVP-4a's payoff.** Diagnostic instrumentation confirmed that ggml's scheduler does **not** route cross-backend tensor copies (the per-layer KV reads under `-nkvo`) through `set_tensor_async` / `get_tensor_async`; those always use the synchronous buffer-level path (`buffer.set_tensor` / `get_tensor`). The only consumer of the async backend interface in this stack is llama.cpp's sampler fetching the logit tensor once per decode step. On a 32-token Qwen 0.5B F16 run we measured 9 async-get calls / ~5 MiB total — a transfer share of ~0.08 % of decode wall-clock, far below the +7 % uplift in the table above. That uplift is therefore at most ~1.7 σ of session-to-session noise; the Llama Q4_K_M flat result is mechanically forced (zero async calls ever fire). MVP-4a is correctly wired and adds no overhead, so it stays on by default — but real per-token overlap will only materialize once either the ggml scheduler is taught to use the async backend interface for cross-backend copies, or the GCU backend's own per-op `topsStreamSynchronize` is removed (MVP-4b — Scope-2).
 
+  **MVP-4b — queued ops (drop per-op compute sync).** Replaces every op handler's `topsStreamSynchronize` + `pool.free` with a deferred-free routed through `gcu_release_scratch`. Kernels now queue on `compute_stream` without per-op host round-trips; scratch returns to the pool at `graph_compute` end after a single drain synchronize. Llama 3.2 1B Q4_K_M (`--device GCU0 -nkvo 1`, r=5):
+
+  | test  | MVP-4b active       | MVP-4b disabled     | uplift |
+  |-------|---------------------|---------------------|--------|
+  | tg32  | 34.05 ± 0.35 t/s    | 28.57 ± 0.44 t/s    | +19.2% |
+  | tg64  | 33.76 ± 0.15 t/s    | 27.86 ± 0.36 t/s    | +21.2% |
+  | pp512 | 631.98 ± 13.36 t/s  | 605.25 ± 15.75 t/s  | +4.4%  |
+
+  Qwen 2.5 0.5B F16 (`--device GCU0 -nkvo 1`, r=5):
+
+  | test  | MVP-4b active        | MVP-4b disabled      | uplift |
+  |-------|----------------------|----------------------|--------|
+  | tg32  | 43.37 ± 0.08 t/s     | 26.91 ± 0.66 t/s     | +61.2% |
+  | tg64  | 41.36 ± 2.57 t/s     | 26.80 ± 0.38 t/s     | +54.3% |
+  | pp512 | 1634.06 ± 43.89 t/s  | 1597.57 ± 15.68 t/s  | +2.3%  |
+
+  Set `GGML_GCU_NO_QUEUED_OPS=1` to revert each call site to the pre-MVP-4b sync-and-free pattern.
+
+  **Honest read of MVP-4b's payoff.** The token-generation uplift is large and real: +19–21 % on Llama 1B Q4_K_M and +54–61 % on Qwen 0.5B F16 — well outside session-to-session noise in both cases. This directly confirms that per-op `topsStreamSynchronize` host round-trips were the dominant tg bottleneck, not compute throughput itself. Prefill (pp512) gains are smaller (+4 % / +2 %) because its runtime is dominated by matrix multiply kernel time, not host-side dispatch overhead; the relative overhead of a per-op sync is diluted over longer per-op GPU work. The Qwen F16 tg uplift is larger than Llama Q4_K_M's because F16 decode ops are individually cheaper (less compute per op) so the fixed host-roundtrip cost is a larger fraction of total time. In practice MVP-4b brings GCU tg throughput from the ~28–34 t/s range (CPU-synchronized level) to the ~34–43 t/s range — a meaningful step, though absolute throughput is still gated by the S60's per-kernel launch latency at this scale.
+
 ### Known SDK ceilings (per-topsaten investigation)
 
 A few proposed perf improvements were explored against the topsop SDK source (`/Users/root1/gitlab/topsop`) and turned out to require GCU device-kernel work (writing `.tops` code), not just topsaten/topsrt API wiring. Documenting here so future contributors don't re-investigate:
