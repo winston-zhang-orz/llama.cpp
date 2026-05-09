@@ -258,17 +258,12 @@ static void * ggml_backend_gcu_buffer_get_base(ggml_backend_buffer_t buffer) {
     return bctx->base;
 }
 
-static enum ggml_status ggml_backend_gcu_buffer_init_tensor(ggml_backend_buffer_t /*buffer*/, ggml_tensor * tensor) {
-    // For Q-typed weight tensors, MVP-3a stores F16 bytes on the device.
-    // Rewrite nb[] to F16 strides so downstream stride math (in
-    // gcu_op_mul_mat etc.) indexes correctly.
-    if (gcu_q_supported(tensor->type)) {
-        const int64_t bpe_f16 = (int64_t) sizeof(uint16_t);
-        tensor->nb[0] = bpe_f16;
-        tensor->nb[1] = tensor->ne[0] * tensor->nb[0];
-        tensor->nb[2] = tensor->ne[1] * tensor->nb[1];
-        tensor->nb[3] = tensor->ne[2] * tensor->nb[2];
-    }
+static enum ggml_status ggml_backend_gcu_buffer_init_tensor(ggml_backend_buffer_t /*buffer*/, ggml_tensor * /*tensor*/) {
+    // Tensors are views into the slab; ggml-alloc has already set tensor->data.
+    // Q-typed weight tensors store F16 on the device but we deliberately do
+    // not rewrite nb[] here: test-backend-ops re-runs the same ggml_tensor
+    // on CPU for comparison, and CPU MUL_MAT asserts nb[0] matches the
+    // declared Q4 type size. gcu_op_mul_mat derives F16 strides locally.
     return GGML_STATUS_SUCCESS;
 }
 
@@ -306,6 +301,7 @@ static void ggml_backend_gcu_buffer_set_tensor(ggml_backend_buffer_t buffer,
                               (size_t) n_elem * sizeof(ggml_fp16_t),
                               topsMemcpyHostToDevice));
         return;
+
     }
 
     TOPS_CHECK(topsMemcpy((char *) tensor->data + offset, data, size, topsMemcpyHostToDevice));
@@ -808,12 +804,27 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     const ggml_type xt = x->type;
     const ggml_type ot = dst->type;
 
+    // MVP-3a: Q-typed weights live on the device as F16 (Phase B/C). For
+    // every dtype branch downstream, treat the weight as F16. Phase B
+    // already rewrote w->nb[] to F16 strides at init_tensor time.
+    const ggml_type wt_eff = gcu_q_supported(wt) ? GGML_TYPE_F16 : wt;
+
     auto build_2d = [](const ggml_tensor * t, int64_t (& d)[2], int64_t (& s)[2]) {
         const size_t bpe = ggml_type_size(t->type);
         d[0] = t->ne[1];
         d[1] = t->ne[0];
         s[0] = (int64_t) (t->nb[1] / bpe);
         s[1] = (int64_t) (t->nb[0] / bpe);
+    };
+
+    // For Q-typed weights, the device buffer holds F16 bytes (MVP-3a) but
+    // ggml's nb[] still describes the Q4 packing. Build F16-stride dims
+    // locally for the weight only.
+    auto build_2d_q_as_f16 = [](const ggml_tensor * t, int64_t (& d)[2], int64_t (& s)[2]) {
+        d[0] = t->ne[1];
+        d[1] = t->ne[0];
+        s[0] = t->ne[0];   // F16-element stride for next row
+        s[1] = 1;
     };
 
     // All-F32 fast path.
@@ -842,8 +853,9 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     }
 
     // F16-weight path: cast input to F16 if needed, run F16 Linear, cast
-    // output back to dst dtype.
-    GGML_ASSERT(wt == GGML_TYPE_F16);
+    // output back to dst dtype. Q-typed weights take this path with their
+    // device bytes interpreted as F16 (wt_eff == F16).
+    GGML_ASSERT(wt_eff == GGML_TYPE_F16);
     const int64_t M = dst->ne[0];
     const int64_t K = w->ne[0];
     const int64_t N = x->ne[1];
@@ -880,6 +892,12 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     int64_t rhs_d[2] = { M, K }, rhs_s[2] = { K, 1 };
     int64_t out_d[2] = { N, M }, out_s[2] = { M, 1 };
     int64_t bias_d[1] = { M };  int64_t bias_s[1] = { 1 };
+
+    // For Q-typed weights, override rhs strides to match the F16 layout
+    // we actually stored on the device.
+    if (gcu_q_supported(wt)) {
+        build_2d_q_as_f16(w, rhs_d, rhs_s);
+    }
 
     topsatenTensor lhs_f16(topsatenSize_t(lhs_d, 2), topsatenSize_t(lhs_s, 2),
                            TOPSATEN_DATA_FP16, x_data);
@@ -1455,6 +1473,10 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             bool ok = false;
             if (w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ok = true;
             if (w->type == GGML_TYPE_F16 &&
+                (x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32) &&
+                (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32)) ok = true;
+            // MVP-3a: Q-typed weight, stored on device as F16 via dequant-on-load.
+            if (gcu_q_supported(w->type) &&
                 (x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32) &&
                 (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32)) ok = true;
             if (!ok) return false;
