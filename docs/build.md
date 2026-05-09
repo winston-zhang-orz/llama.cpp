@@ -649,6 +649,8 @@ The following ops are implemented on GCU. Any op or shape outside these is autom
 
   Set `GGML_GCU_NO_ASYNC_COPY=1` to fall back to synchronous `topsMemcpy`. Multi-device support is MVP-5 work.
 
+  **Honest read of MVP-4a's payoff.** Diagnostic instrumentation confirmed that ggml's scheduler does **not** route cross-backend tensor copies (the per-layer KV reads under `-nkvo`) through `set_tensor_async` / `get_tensor_async`; those always use the synchronous buffer-level path (`buffer.set_tensor` / `get_tensor`). The only consumer of the async backend interface in this stack is llama.cpp's sampler fetching the logit tensor once per decode step. On a 32-token Qwen 0.5B F16 run we measured 9 async-get calls / ~5 MiB total — a transfer share of ~0.08 % of decode wall-clock, far below the +7 % uplift in the table above. That uplift is therefore at most ~1.7 σ of session-to-session noise; the Llama Q4_K_M flat result is mechanically forced (zero async calls ever fire). MVP-4a is correctly wired and adds no overhead, so it stays on by default — but real per-token overlap will only materialize once either the ggml scheduler is taught to use the async backend interface for cross-backend copies, or the GCU backend's own per-op `topsStreamSynchronize` is removed (MVP-4b — Scope-2).
+
 ### Known SDK ceilings (per-topsaten investigation)
 
 A few proposed perf improvements were explored against the topsop SDK source (`/Users/root1/gitlab/topsop`) and turned out to require GCU device-kernel work (writing `.tops` code), not just topsaten/topsrt API wiring. Documenting here so future contributors don't re-investigate:
