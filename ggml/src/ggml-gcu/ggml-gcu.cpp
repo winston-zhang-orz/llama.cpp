@@ -1584,11 +1584,13 @@ static void gcu_build_rope_cos_sin_host(int n_dims, int max_pos,
     }
 }
 
-// ROPE. ggml mode 0 only.
+// ROPE. NORMAL (mode 0) and NEOX (mode bit 1) supported. YARN, MROPE,
+// VISION, IMROPE go to CPU.
 //
 // Inputs: x [head_dim, n_heads, n_tokens, 1] F32/F16; pos [n_tokens] I32.
 // Maps to topsvllmRotaryEmbedding(query, key, positions, cos_sin_cache,
-//   head_size, is_neox=false, stream).
+//   head_size, is_neox, stream). is_neox=true rotates split halves
+// (NeoX/Phi style) instead of interleaved pairs.
 // We treat x as the query; pass a small zero-filled scratch as key
 // (topsvllm rotates both; we ignore the dummy key result).
 // Positions get cast to I64 on host. cos_sin table is precomputed on host
@@ -1600,6 +1602,8 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     ggml_tensor * pos = dst->src[1];
 
     const int32_t n_dims = ((const int32_t *) dst->op_params)[1];
+    const int32_t mode   = ((const int32_t *) dst->op_params)[2];
+    const bool    is_neox = (mode & GGML_ROPE_TYPE_NEOX) != 0;
     float freq_base, freq_scale;
     memcpy(&freq_base,  (const int32_t *) dst->op_params + 5, sizeof(float));
     memcpy(&freq_scale, (const int32_t *) dst->op_params + 6, sizeof(float));
@@ -1696,7 +1700,7 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
                          cs_is_f16 ? TOPSATEN_DATA_FP16 : TOPSATEN_DATA_FP32, cs_dev);
 
     TOPSATEN_CHECK(topsvllmRotaryEmbedding(q_tt, k_tt, pos_tt, cs_tt,
-                                           (int) head_dim, /*is_neox=*/false,
+                                           (int) head_dim, is_neox,
                                            ctx->compute_stream));
 
     gcu_release_scratch(ctx, cs_dev,        cs_bytes);
@@ -2198,7 +2202,9 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             float ext_factor, attn_factor;
             memcpy(&ext_factor,  (const int32_t *) op->op_params + 7, sizeof(float));
             memcpy(&attn_factor, (const int32_t *) op->op_params + 8, sizeof(float));
-            if (mode != 0) return false;
+            // NORMAL (0) and NEOX (bit 1) supported. MROPE / VISION /
+            // IMROPE / YARN not supported — drop to CPU.
+            if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) return false;
             if (ext_factor != 0.0f) return false;
             if (attn_factor != 0.0f && attn_factor != 1.0f) return false;
             if (op->src[2]) return false;            // freq factors (yarn) not supported

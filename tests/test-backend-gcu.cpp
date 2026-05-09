@@ -1459,6 +1459,82 @@ static int test_mul_mat_id_f16(ggml_backend_t gcu) {
     return 0;
 }
 
+// ROPE NEOX-mode (mode=2). Splits the head dim into two halves and
+// rotates them as a pair (NeoX/Phi convention) instead of interleaved
+// pairs. Same cos/sin table; different application.
+static int test_rope_neox(ggml_backend_t gcu) {
+    const int64_t head_dim = 64, n_heads = 8, n_tokens = 16;
+    const int     n_dims = (int) head_dim;
+    const float   freq_base = 10000.0f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, n_tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * c   = ggml_rope(ctx, a, pos, n_dims, GGML_ROPE_TYPE_NEOX);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ROPE_NEOX: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    const size_t n = (size_t) head_dim * n_heads * n_tokens;
+    std::vector<float>   ha(n), hc(n), expected(n);
+    std::vector<int32_t> hp(n_tokens);
+    fill_random_f32(ha.data(), n, 14);
+    for (int64_t t = 0; t < n_tokens; t++) hp[t] = (int32_t) t;
+
+    // CPU reference for NEOX: rotate pair (i, i+half) instead of (i, i+1).
+    //   theta_i = freq_base^(-2*i/n_dims), angle = pos * theta_i, i in [0, half)
+    //   y[i]      = x[i]*cos - x[i+half]*sin
+    //   y[i+half] = x[i]*sin + x[i+half]*cos
+    const int half = n_dims / 2;
+    for (int64_t t = 0; t < n_tokens; t++) {
+        const int p_idx = hp[t];
+        for (int64_t h = 0; h < n_heads; h++) {
+            const float * xrow = ha.data()       + (t * n_heads + h) * head_dim;
+            float       * yrow = expected.data() + (t * n_heads + h) * head_dim;
+            for (int i = 0; i < half; i++) {
+                const float theta = std::pow(freq_base, -2.0f * (float) i / (float) n_dims);
+                const float angle = (float) p_idx * theta;
+                const float c1 = std::cos(angle), s1 = std::sin(angle);
+                const float x0 = xrow[i];
+                const float x1 = xrow[i + half];
+                yrow[i]        = x0 * c1 - x1 * s1;
+                yrow[i + half] = x0 * s1 + x1 * c1;
+            }
+            for (int i = n_dims; i < head_dim; i++) yrow[i] = xrow[i];
+        }
+    }
+
+    ggml_backend_tensor_set(a,   ha.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(pos, hp.data(), 0, n_tokens * sizeof(int32_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ROPE_NEOX: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 1e-3f, 1e-3f)) {
+            if (bad < 5) fprintf(stderr, "ROPE_NEOX: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ROPE_NEOX: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("ROPE_NEOX: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
 // === F16 dtype variants =================================================
 //
 // Mirror the existing F32 tests on F16 tensors. The reference is computed
@@ -2214,6 +2290,7 @@ int main() {
     rc |= test_softmax_f16(gcu);
     rc |= test_rope(gcu);
     rc |= test_rope_f16(gcu);
+    rc |= test_rope_neox(gcu);
     rc |= test_mul_mat_mixed(gcu);
     rc |= test_mul_mat_mixed_f16in(gcu);
     rc |= test_mul_mat_id(gcu);

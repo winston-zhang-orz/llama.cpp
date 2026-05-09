@@ -608,7 +608,7 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 - Element-wise: `ADD`, `MUL`, `SCALE` (bias = 0 only), `CONCAT`
 - Activations: `SILU`, `GELU`, `GELU_QUICK`, `RELU`, `TANH`, `SIGMOID`, `HARDSWISH`, `HARDSIGMOID` (all via `GGML_OP_UNARY`)
 - Normalization: `NORM` (LayerNorm without affine), `RMS_NORM`
-- Position encoding: `ROPE` (mode 0 only — no NEOX, no YARN, no MROPE; F32 and F16)
+- Position encoding: `ROPE` (NORMAL mode 0 + NEOX mode 2; no YARN, no MROPE/VISION/IMROPE; F32 and F16)
 - Reduction: `SOFT_MAX` (with optional mask, `max_bias = 0`, no softmax sinks)
 - Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast; Q4_0 / Q8_0 / Q4_K weights via F16 dequant-on-load)
 - MoE dispatch: `MUL_MAT_ID` (same dtype matrix as `MUL_MAT`; per-(token, expert-slot) `topsatenLinear` loop; F16-weight path casts F32 input once for the whole sweep). Required for Gemma 4 26B A4B and other MoE models.
