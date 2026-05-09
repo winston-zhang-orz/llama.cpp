@@ -13,6 +13,7 @@
 #include "ggml-cpu.h"
 #include "ggml-gcu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -562,6 +563,308 @@ static int test_mul_mat_id(ggml_backend_t gcu) {
     return 0;
 }
 
+// Element-wise MUL: dst = a * b on F32, large 2D tensor. Mirrors test_add.
+static int test_mul(ggml_backend_t gcu) {
+    const int64_t M = 1024, N = 4096;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_mul(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hb(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 41);
+    fill_random_f32(hb.data(), n, 42);
+    for (size_t i = 0; i < n; i++) expected[i] = ha[i] * hb[i];
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(b, hb.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!close_enough(hc[i], expected[i], 1e-5f, 1e-5f)) {
+            if (bad < 5) fprintf(stderr, "MUL: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "MUL: %d mismatches\n", bad); return 1; }
+    printf("MUL: ok (%zu elements)\n", n);
+    return 0;
+}
+
+// SCALE: dst = a * scalar. F32 only (the GCU path lives in gcu_op_scale).
+static int test_scale(ggml_backend_t gcu) {
+    const int64_t M = 512, N = 2048;
+    const size_t  n = (size_t) M * N;
+    const float   s = 0.125f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_scale(ctx, a, s);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "SCALE: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 51);
+    for (size_t i = 0; i < n; i++) expected[i] = ha[i] * s;
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "SCALE: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!close_enough(hc[i], expected[i], 1e-5f, 1e-5f)) {
+            if (bad < 5) fprintf(stderr, "SCALE: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "SCALE: %d mismatches\n", bad); return 1; }
+    printf("SCALE: ok (%zu elements)\n", n);
+    return 0;
+}
+
+// GET_ROWS: dst[i, :] = src[indices[i], :].  Indices are i32 per ggml.
+// gcu_op_get_rows supports F32 src only, unbatched (ne[2]/ne[3] == 1).
+static int test_get_rows(ggml_backend_t gcu) {
+    const int64_t cols   = 256;
+    const int64_t n_rows = 128;     // rows in source
+    const int64_t n_take = 64;      // rows to gather
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, n_rows);
+    ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_take);
+    ggml_tensor * out = ggml_get_rows(ctx, src, idx);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "GET_ROWS: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>   h_src((size_t) cols * n_rows);
+    std::vector<int32_t> h_idx((size_t) n_take);
+    std::vector<float>   h_out((size_t) cols * n_take);
+    std::vector<float>   expected((size_t) cols * n_take);
+
+    fill_random_f32(h_src.data(), h_src.size(), 61);
+    // Picking indices including duplicates and edges to exercise the lookup.
+    std::mt19937 rng(62);
+    std::uniform_int_distribution<int32_t> idx_dist(0, (int32_t) n_rows - 1);
+    for (int64_t i = 0; i < n_take; i++) h_idx[i] = idx_dist(rng);
+
+    for (int64_t i = 0; i < n_take; i++) {
+        const int32_t r = h_idx[i];
+        const float * src_row = h_src.data() + (size_t) r * cols;
+        float       * dst_row = expected.data() + (size_t) i * cols;
+        std::memcpy(dst_row, src_row, cols * sizeof(float));
+    }
+
+    ggml_backend_tensor_set(src, h_src.data(), 0, h_src.size() * sizeof(float));
+    ggml_backend_tensor_set(idx, h_idx.data(), 0, h_idx.size() * sizeof(int32_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "GET_ROWS: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(out, h_out.data(), 0, h_out.size() * sizeof(float));
+
+    int bad = 0;
+    for (size_t i = 0; i < h_out.size(); i++) {
+        if (h_out[i] != expected[i]) {
+            if (bad < 5) fprintf(stderr, "GET_ROWS: mismatch idx=%zu got=%f want=%f\n", i, h_out[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "GET_ROWS: %d mismatches\n", bad); return 1; }
+    printf("GET_ROWS: ok (%zu elements)\n", h_out.size());
+    return 0;
+}
+
+// SET_ROWS: write src rows into a F32 destination at index positions.
+// Per ggml's contract:
+//   a (dst): [n_embd, ne1, ne2, ne3]
+//   b (src): [n_embd, n_rows, ne02, ne03]
+//   c (idx): I64 [n_rows, ne11, ne12, 1]   c[i] in [0, ne1)
+// gcu_op_set_rows accepts F32 dst only; we run unbatched (ne02=1, ne03=1).
+static int test_set_rows(ggml_backend_t gcu) {
+    const int64_t cols   = 256;
+    const int64_t n_dst  = 128;     // rows in destination
+    const int64_t n_src  = 64;      // rows to write
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, n_dst);
+    ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, n_src);
+    ggml_tensor * idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, n_src, 1);
+    ggml_tensor * out = ggml_set_rows(ctx, dst, src, idx);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "SET_ROWS: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>   h_dst((size_t) cols * n_dst);
+    std::vector<float>   h_src((size_t) cols * n_src);
+    std::vector<int64_t> h_idx((size_t) n_src);
+    std::vector<float>   h_out((size_t) cols * n_dst);
+    std::vector<float>   expected((size_t) cols * n_dst);
+
+    fill_random_f32(h_dst.data(), h_dst.size(), 71);
+    fill_random_f32(h_src.data(), h_src.size(), 72);
+
+    // Distinct row indices so destination semantics are well-defined
+    // (ggml says "undefined behavior if destination rows overlap").
+    std::vector<int64_t> all(n_dst);
+    for (int64_t i = 0; i < n_dst; i++) all[i] = i;
+    std::mt19937 rng(73);
+    std::shuffle(all.begin(), all.end(), rng);
+    for (int64_t i = 0; i < n_src; i++) h_idx[i] = all[i];
+
+    // CPU reference: start from h_dst, then overwrite the indexed rows
+    // with the corresponding src rows.
+    expected = h_dst;
+    for (int64_t i = 0; i < n_src; i++) {
+        const int64_t r = h_idx[i];
+        std::memcpy(expected.data() + (size_t) r * cols,
+                    h_src.data()    + (size_t) i * cols,
+                    cols * sizeof(float));
+    }
+
+    ggml_backend_tensor_set(dst, h_dst.data(), 0, h_dst.size() * sizeof(float));
+    ggml_backend_tensor_set(src, h_src.data(), 0, h_src.size() * sizeof(float));
+    ggml_backend_tensor_set(idx, h_idx.data(), 0, h_idx.size() * sizeof(int64_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "SET_ROWS: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    // ggml_set_rows returns a view over the destination — the result lives
+    // in dst's memory.
+    ggml_backend_tensor_get(dst, h_out.data(), 0, h_out.size() * sizeof(float));
+
+    int bad = 0;
+    for (size_t i = 0; i < h_out.size(); i++) {
+        if (h_out[i] != expected[i]) {
+            if (bad < 5) fprintf(stderr, "SET_ROWS: mismatch idx=%zu got=%f want=%f\n", i, h_out[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "SET_ROWS: %d mismatches\n", bad); return 1; }
+    printf("SET_ROWS: ok (%zu elements)\n", h_out.size());
+    return 0;
+}
+
+// CPY: same-dtype contiguous and F32<->F16 conversion. The handler is
+// shared with DUP/CONT, so this also exercises that code path.
+static int test_cpy(ggml_backend_t gcu) {
+    const int64_t M = 512, N = 1024;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * a_dup   = ggml_dup(ctx, a);                            // F32->F32
+    ggml_tensor * a_f16_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, M, N);
+    ggml_tensor * a_f16   = ggml_cpy(ctx, a, a_f16_t);                   // F32->F16 cast
+    ggml_tensor * a_f32   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * a_back  = ggml_cpy(ctx, a_f16, a_f32);                 // F16->F32 cast
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "CPY: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       ha(n), hdup(n), hback(n);
+    std::vector<ggml_fp16_t> hf16(n);
+    std::vector<float>       expected_f16_round(n);
+    fill_random_f32(ha.data(), n, 81);
+    // F16 round-trip reference
+    {
+        std::vector<ggml_fp16_t> tmp16(n);
+        ggml_fp32_to_fp16_row(ha.data(), tmp16.data(), n);
+        ggml_fp16_to_fp32_row(tmp16.data(), expected_f16_round.data(), n);
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, a_dup);
+    ggml_build_forward_expand(graph, a_back);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "CPY: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(a_dup, hdup.data(),  0, n * sizeof(float));
+    ggml_backend_tensor_get(a_f16, hf16.data(),  0, n * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_get(a_back, hback.data(), 0, n * sizeof(float));
+
+    int bad_dup = 0, bad_round = 0, bad_f16 = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (hdup[i]  != ha[i])                           { if (bad_dup   < 3) fprintf(stderr, "CPY-DUP: mismatch idx=%zu got=%f want=%f\n", i, hdup[i], ha[i]);   bad_dup++; }
+        // F32->F16 quantization: each F32 must round to the F16 we store.
+        const float f16_back = ggml_fp16_to_fp32(hf16[i]);
+        if (f16_back != expected_f16_round[i])           { if (bad_f16   < 3) fprintf(stderr, "CPY-F32toF16: mismatch idx=%zu got=%f want=%f\n", i, f16_back, expected_f16_round[i]); bad_f16++; }
+        // F16 round-trip: dst F32 must equal hf16's F32 expansion.
+        if (!close_enough(hback[i], expected_f16_round[i], 1e-5f, 1e-5f)) {
+            if (bad_round < 3) fprintf(stderr, "CPY-F16toF32: mismatch idx=%zu got=%f want=%f\n", i, hback[i], expected_f16_round[i]);
+            bad_round++;
+        }
+    }
+
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad_dup || bad_f16 || bad_round) {
+        fprintf(stderr, "CPY: %d dup-mismatches, %d F32->F16 mismatches, %d round-trip mismatches\n",
+                bad_dup, bad_f16, bad_round);
+        return 1;
+    }
+    printf("CPY: ok (%zu elements; F32->F32, F32->F16, F16->F32)\n", n);
+    return 0;
+}
+
 // Numerical-equality test for the async H<->D path. Builds an
 // (a + b) * c chain on GCU; populates the inputs via
 // ggml_backend_tensor_set_async, runs graph_compute, reads back via
@@ -659,6 +962,11 @@ int main() {
 
     int rc = 0;
     rc |= test_add(gcu);
+    rc |= test_mul(gcu);
+    rc |= test_scale(gcu);
+    rc |= test_get_rows(gcu);
+    rc |= test_set_rows(gcu);
+    rc |= test_cpy(gcu);
     rc |= test_mul_mat(gcu);
     rc |= test_silu(gcu);
     rc |= test_rms_norm(gcu);
