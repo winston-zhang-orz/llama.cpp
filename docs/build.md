@@ -603,11 +603,11 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 
 ### Operator coverage (MVP-2)
 
-**26 ops dispatched / 19 distinct kernels** (the 4 view ops are zero-copy and 3 of `CPY`/`DUP`/`CONT` share one handler; 7 unary subtypes share the `GGML_OP_UNARY` dispatcher but call distinct topsaten kernels). Any op or shape outside these is automatically routed to CPU by ggml's scheduler:
+**27 ops dispatched / 20 distinct kernels** (the 4 view ops are zero-copy and 3 of `CPY`/`DUP`/`CONT` share one handler; 7 unary subtypes share the `GGML_OP_UNARY` dispatcher but call distinct topsaten kernels). Any op or shape outside these is automatically routed to CPU by ggml's scheduler:
 
 - Element-wise: `ADD`, `MUL`, `SCALE` (bias = 0 only)
 - Activations: `SILU`, `GELU`, `GELU_QUICK`, `RELU`, `TANH`, `SIGMOID`, `HARDSWISH`, `HARDSIGMOID` (all via `GGML_OP_UNARY`)
-- Normalization: `RMS_NORM`
+- Normalization: `NORM` (LayerNorm without affine), `RMS_NORM`
 - Position encoding: `ROPE` (mode 0 only — no NEOX, no YARN, no MROPE; F32 and F16)
 - Reduction: `SOFT_MAX` (with optional mask, `max_bias = 0`, no softmax sinks)
 - Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast; Q4_0 / Q8_0 / Q4_K weights via F16 dequant-on-load)

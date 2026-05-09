@@ -998,6 +998,74 @@ static bool gcu_op_rms_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// NORM (LayerNorm without affine). y = (x - mean(x)) / sqrt(var(x) + eps).
+// Maps to topsatenLayerNorm, which always applies an affine; we feed
+// weight=ones / bias=zeros to recover the unscaled normalize that ggml's
+// GGML_OP_NORM specifies. The follow-on weight/bias multiplications are
+// separate ggml ops (MUL / ADD) that the scheduler dispatches as usual.
+static bool gcu_op_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const int64_t hidden_size = src->ne[0];
+
+    // F32 ones for the unit affine weight. Cast to F16 if input dtype is F16.
+    void * ones_f32   = gcu_get_ones_f32(ctx, hidden_size);
+    void * weight_data = ones_f32;
+    size_t cast_bytes  = 0;
+    void * cast_buf    = nullptr;
+    topsatenDataType_t affine_dtype = TOPSATEN_DATA_FP32;
+    if (src->type == GGML_TYPE_F16) {
+        cast_bytes = (size_t) hidden_size * sizeof(uint16_t);
+        cast_buf   = ctx->pool.alloc(cast_bytes);
+        int64_t gd[1] = { hidden_size };
+        int64_t gs[1] = { 1 };
+        topsatenTensor f32_t(topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
+                             TOPSATEN_DATA_FP32, ones_f32);
+        topsatenTensor f16_t(topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
+                             TOPSATEN_DATA_FP16, cast_buf);
+        topsatenDataType_t target = TOPSATEN_DATA_FP16;
+        TOPSATEN_CHECK(topsatenTo(f16_t, f32_t, target, false, true,
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
+        weight_data  = cast_buf;
+        affine_dtype = TOPSATEN_DATA_FP16;
+    }
+
+    // Bias = zeros, sized in bytes for the chosen dtype. The shared
+    // zero_bias buffer is zero-filled and oversized; we just need the
+    // first hidden_size elements interpreted in our dtype.
+    const size_t bias_bytes = (size_t) hidden_size *
+        ((src->type == GGML_TYPE_F16) ? sizeof(uint16_t) : sizeof(float));
+    void * bias_data = gcu_get_zero_bias(ctx, bias_bytes);
+
+    int64_t affine_d[1] = { hidden_size };
+    int64_t affine_s[1] = { 1 };
+    topsatenTensor weight(topsatenSize_t(affine_d, 1), topsatenSize_t(affine_s, 1),
+                          affine_dtype, weight_data);
+    topsatenTensor bias  (topsatenSize_t(affine_d, 1), topsatenSize_t(affine_s, 1),
+                          affine_dtype, bias_data);
+
+    // Collapse outer dims so input is rank-2 [n_rows, hidden_size].
+    const int64_t n_rows = src->ne[1] * src->ne[2] * src->ne[3];
+    int64_t io_d[2] = { n_rows, hidden_size };
+    int64_t io_s[2] = { hidden_size, 1 };
+    topsatenTensor in_t (topsatenSize_t(io_d, 2), topsatenSize_t(io_s, 2),
+                         ggml_to_topsaten_dtype(src->type), src->data);
+    topsatenTensor out_t(topsatenSize_t(io_d, 2), topsatenSize_t(io_s, 2),
+                         ggml_to_topsaten_dtype(dst->type), dst->data);
+
+    int64_t norm_shape[1] = { hidden_size };
+    topsatenScalar_t eps_s; eps_s.dtype = TOPSATEN_DATA_FP32; eps_s.fval = eps;
+
+    TOPSATEN_CHECK(topsatenLayerNorm(out_t, in_t,
+                                     topsatenSize_t(norm_shape, 1),
+                                     weight, bias, eps_s, ctx->compute_stream));
+
+    gcu_release_scratch(ctx, cast_buf, cast_bytes);
+    return true;
+}
+
 // MUL_MAT.
 //
 // ggml's MUL_MAT semantics: dst = src[0]^T @ src[1]
@@ -1772,6 +1840,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_mul_mat_id(ctx, node);
         case GGML_OP_SOFT_MAX:
             return gcu_op_soft_max(ctx, node);
+        case GGML_OP_NORM:
+            return gcu_op_norm(ctx, node);
         case GGML_OP_RMS_NORM:
             return gcu_op_rms_norm(ctx, node);
         case GGML_OP_ROPE:
@@ -2066,6 +2136,13 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             return true;
         }
         case GGML_OP_RMS_NORM: {
+            if (!gcu_dtype_supported(op->src[0]->type)) return false;
+            if (op->src[0]->type != op->type) return false;
+            if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_NORM: {
+            // LayerNorm without affine. Same dtype constraints as RMS_NORM.
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
