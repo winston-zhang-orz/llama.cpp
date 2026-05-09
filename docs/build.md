@@ -584,6 +584,16 @@ GCU prompt-processing wins at every tested length, peaking around pp128–512 (~
 
 A 3.6× swing from doubling the model size: GCU's per-op launch overhead amortizes over larger per-layer compute. Generation throughput is similar on both backends for both models (~30 t/s) because per-token decode is bounded by H↔D for the KV cache (`-nkvo` keeps it CPU-resident). For real models in this size range and up, **GCU is the clear win for prompt-heavy workloads** (RAG, summarization). Generation-heavy workloads see modest gains.
 
+**Long-context durability** — GCU advantage holds at long contexts on the 1B model:
+
+| Llama 1B Q4_K_M | pp64 | pp128 | pp512 | pp1024 | pp2048 | pp4096 |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU | 240 | 248 | 236 | 221 | 196 | 162 |
+| GCU | 576 | 700 | 645 | 539 | 408 | 288 |
+| Speedup | 2.40× | 2.83× | 2.73× | 2.44× | 2.08× | 1.78× |
+
+The advantage degrades as context grows (the F16 KV cache crossing H↔D for every token bottlenecks both backends), but remains substantial at 4K context. Larger models would show even more durable advantage.
+
 **Recommended invocation for real models on GCU:**
 ```sh
 ./build/bin/llama-cli -m model.gguf --device GCU0 -nkvo -p "..." -n 64
