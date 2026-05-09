@@ -200,12 +200,14 @@ struct ggml_backend_gcu_context {
     int64_t ones_n0_count   = 0;
 
     // MVP-4a: async H<->D plumbing.
-    // last_copy_event:    recorded on copy_stream after each set_tensor_async H->D enqueue
-    // last_compute_event: recorded on compute_stream at end of graph_compute
-    // copy_event_armed:   guards the first wait — recording-without-arming is undefined SDK behavior
+    // last_copy_event:      recorded on copy_stream after each set_tensor_async H->D enqueue
+    // last_compute_event:   recorded on compute_stream at end of graph_compute
+    // copy_event_armed:     guards the first wait — recording-without-arming is undefined SDK behavior
+    // compute_event_armed:  symmetric guard for get_tensor_async; set by graph_compute (Task 3)
     topsEvent_t  last_copy_event    = nullptr;
     topsEvent_t  last_compute_event = nullptr;
     bool         copy_event_armed   = false;
+    bool         compute_event_armed = false;
 
     explicit ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
         TOPS_CHECK(topsSetDevice(device));
@@ -520,6 +522,12 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
     return GGML_STATUS_SUCCESS;
 }
 
+// Mirrors ggml_backend_buffer_is_cuda: detect a GCU device buffer by
+// comparing the free_buffer function pointer (unique to GCU device buffers).
+static bool ggml_backend_buffer_is_gcu(ggml_backend_buffer_t buffer) {
+    return buffer->iface.free_buffer == ggml_backend_gcu_buffer_free_buffer;
+}
+
 // MVP-4a: async H<->D on copy_stream. The synchronous buffer-level
 // set_tensor (which carries the Q-typed dequant path) is left intact —
 // only F32/F16 activation and KV traffic flows through here.
@@ -528,7 +536,8 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
 // skips event arming, mirroring the GGML_GCU_NO_PINNED rollback switch.
 
 static bool gcu_async_disabled() {
-    return getenv("GGML_GCU_NO_ASYNC_COPY") != nullptr;
+    static const bool disabled = (getenv("GGML_GCU_NO_ASYNC_COPY") != nullptr);
+    return disabled;
 }
 
 static void ggml_backend_gcu_set_tensor_async(
@@ -544,6 +553,12 @@ static void ggml_backend_gcu_set_tensor_async(
 
     auto * ctx = (ggml_backend_gcu_context *) backend->context;
     TOPS_CHECK(topsSetDevice(ctx->device));
+
+    // Reject tensors not backed by a GCU device buffer.  view_src tensors
+    // inherit their storage from the source tensor, so check its buffer.
+    // Mirrors the defensive pattern in ggml_backend_buffer_is_cuda.
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    GGML_ASSERT(buf && ggml_backend_buffer_is_gcu(buf) && "tensor not in GCU buffer");
 
     if (gcu_async_disabled()) {
         TOPS_CHECK(topsMemcpy((char *) tensor->data + offset, data, size,
@@ -567,6 +582,10 @@ static void ggml_backend_gcu_get_tensor_async(
     auto * ctx = (ggml_backend_gcu_context *) backend->context;
     TOPS_CHECK(topsSetDevice(ctx->device));
 
+    // Reject tensors not backed by a GCU device buffer (mirrors set_tensor_async).
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    GGML_ASSERT(buf && ggml_backend_buffer_is_gcu(buf) && "tensor not in GCU buffer");
+
     if (gcu_async_disabled()) {
         TOPS_CHECK(topsMemcpy(data, (const char *) tensor->data + offset, size,
                               topsMemcpyDeviceToHost));
@@ -574,7 +593,12 @@ static void ggml_backend_gcu_get_tensor_async(
     }
 
     // D->H must not race still-running compute.
-    TOPS_CHECK(topsStreamWaitEvent(ctx->copy_stream, ctx->last_compute_event, 0));
+    // Guard with compute_event_armed: topsStreamWaitEvent on an unarmed event
+    // is implementation-defined in topsrt (symmetric to copy_event_armed).
+    // Task 3 will set compute_event_armed = true after recording the event.
+    if (ctx->compute_event_armed) {
+        TOPS_CHECK(topsStreamWaitEvent(ctx->copy_stream, ctx->last_compute_event, 0));
+    }
     TOPS_CHECK(topsMemcpyAsync(
         data, (const char *) tensor->data + offset, size,
         topsMemcpyDeviceToHost, ctx->copy_stream));
