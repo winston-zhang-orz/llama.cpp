@@ -998,6 +998,32 @@ static bool gcu_op_rms_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// CONCAT along the given ggml axis. ggml's dim is innermost-first
+// (dim 0 = ne[0]), topsaten/PyTorch is slowest-first, so we flip it
+// to match the shape order make_topsaten_tensor produces.
+static bool gcu_op_concat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * a = dst->src[0];
+    ggml_tensor * b = dst->src[1];
+
+    const int32_t ggml_dim = ((const int32_t *) dst->op_params)[0];
+
+    gcu_tensor_dims da, db, dout;
+    topsatenTensor a_t   = make_topsaten_tensor(a,   da);
+    topsatenTensor b_t   = make_topsaten_tensor(b,   db);
+    topsatenTensor out_t = make_topsaten_tensor(dst, dout);
+
+    int rank = ggml_n_dims(dst);
+    if (rank < 1) rank = 1;
+    const int64_t topsaten_dim = (int64_t) (rank - 1 - ggml_dim);
+
+    std::vector<topsatenTensor> inputs;
+    inputs.reserve(2);
+    inputs.push_back(a_t);
+    inputs.push_back(b_t);
+    TOPSATEN_CHECK(topsatenCat(out_t, inputs, topsaten_dim, ctx->compute_stream));
+    return true;
+}
+
 // NORM (LayerNorm without affine). y = (x - mean(x)) / sqrt(var(x) + eps).
 // Maps to topsatenLayerNorm, which always applies an affine; we feed
 // weight=ones / bias=zeros to recover the unscaled normalize that ggml's
@@ -1840,6 +1866,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_mul_mat_id(ctx, node);
         case GGML_OP_SOFT_MAX:
             return gcu_op_soft_max(ctx, node);
+        case GGML_OP_CONCAT:
+            return gcu_op_concat(ctx, node);
         case GGML_OP_NORM:
             return gcu_op_norm(ctx, node);
         case GGML_OP_RMS_NORM:
@@ -2146,6 +2174,17 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_CONCAT: {
+            // Same dtype, contiguous; no other constraints — topsatenCat
+            // handles dim selection.
+            const ggml_tensor * a = op->src[0];
+            const ggml_tensor * b = op->src[1];
+            if (!a || !b) return false;
+            if (!gcu_dtype_supported(a->type)) return false;
+            if (a->type != b->type || a->type != op->type) return false;
+            if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) return false;
             return true;
         }
         case GGML_OP_ROPE: {

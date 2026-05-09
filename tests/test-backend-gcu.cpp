@@ -1232,6 +1232,60 @@ static int test_set_rows(ggml_backend_t gcu) {
     return 0;
 }
 
+// CONCAT along innermost dim. Two F32 2D tensors with matching outer
+// dim, concatenated along the innermost axis (typical KV-cache-style
+// assembly: append new tokens' values to existing rows).
+static int test_concat(ggml_backend_t gcu) {
+    const int64_t Ka = 64, Kb = 32, M = 128;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Ka, M);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Kb, M);
+    ggml_tensor * c = ggml_concat(ctx, a, b, 0);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "CONCAT: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha((size_t) Ka * M), hb((size_t) Kb * M);
+    std::vector<float> hc((size_t)(Ka + Kb) * M), expected((size_t)(Ka + Kb) * M);
+    fill_random_f32(ha.data(), ha.size(), 421);
+    fill_random_f32(hb.data(), hb.size(), 422);
+    // Reference: per row m, copy ha[m*Ka..] then hb[m*Kb..].
+    for (int64_t m = 0; m < M; m++) {
+        std::memcpy(expected.data() + m * (Ka + Kb),
+                    ha.data() + m * Ka, Ka * sizeof(float));
+        std::memcpy(expected.data() + m * (Ka + Kb) + Ka,
+                    hb.data() + m * Kb, Kb * sizeof(float));
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_backend_tensor_set(b, hb.data(), 0, hb.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "CONCAT: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(float));
+
+    int bad = 0;
+    for (size_t i = 0; i < hc.size(); i++) {
+        if (hc[i] != expected[i]) {
+            if (bad < 5) fprintf(stderr, "CONCAT: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "CONCAT: %d mismatches\n", bad); return 1; }
+    printf("CONCAT: ok (%zu elements, dim=0)\n", hc.size());
+    return 0;
+}
+
 // CPY: same-dtype contiguous and F32<->F16 conversion. The handler is
 // shared with DUP/CONT, so this also exercises that code path.
 static int test_cpy(ggml_backend_t gcu) {
@@ -2137,6 +2191,7 @@ int main() {
     rc |= test_scale(gcu);
     rc |= test_get_rows(gcu);
     rc |= test_set_rows(gcu);
+    rc |= test_concat(gcu);
     rc |= test_cpy(gcu);
     rc |= test_mul_mat(gcu);
     rc |= test_mul_mat_q4_0(gcu);
