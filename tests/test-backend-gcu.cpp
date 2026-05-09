@@ -461,6 +461,87 @@ static int test_mul_mat_mixed(ggml_backend_t gcu) {
     return 0;
 }
 
+// MUL_MAT_MIXED variant with F16 input (instead of F32): F16w × F16x -> F32.
+// Fills the third dtype combo in the F16-weight family of MUL_MAT:
+//   F32w × F32x → F32   (test_mul_mat)
+//   F16w × F32x → F32   (test_mul_mat_mixed)
+//   F16w × F16x → F32   (this test)
+// This is the path Qwen 0.5B F16 hits when activations stay on-device as
+// F16 between layers — common for fully-F16 models without input casts.
+static int test_mul_mat_mixed_f16in(ggml_backend_t gcu) {
+    const int64_t K = 1024, M = 2048, N = 1024;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, M);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, N);
+    ggml_tensor * c = ggml_mul_mat(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL_MAT_MIXED_F16in: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       ha_f32((size_t) K * M);
+    std::vector<float>       hb_f32((size_t) K * N);
+    std::vector<ggml_fp16_t> ha((size_t) K * M);
+    std::vector<ggml_fp16_t> hb((size_t) K * N);
+    std::vector<float>       hc((size_t) M * N), expected((size_t) M * N);
+    fill_random_f32(ha_f32.data(), ha_f32.size(), 271);
+    fill_random_f32(hb_f32.data(), hb_f32.size(), 272);
+    ggml_fp32_to_fp16_row(ha_f32.data(), ha.data(), ha_f32.size());
+    ggml_fp32_to_fp16_row(hb_f32.data(), hb.data(), hb_f32.size());
+
+    // Reference accumulates in F32 from the F16-rounded inputs (the same
+    // values the device sees), so the comparison only catches on-device
+    // F16-accumulator drift.
+    for (int64_t nn = 0; nn < N; nn++) {
+        for (int64_t mm = 0; mm < M; mm++) {
+            float acc = 0.0f;
+            const ggml_fp16_t * apf = ha.data() + mm * K;
+            const ggml_fp16_t * bpf = hb.data() + nn * K;
+            for (int64_t k = 0; k < K; k++) {
+                acc += ggml_fp16_to_fp32(apf[k]) * ggml_fp16_to_fp32(bpf[k]);
+            }
+            expected[mm + nn * M] = acc;
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(b, hb.data(), 0, hb.size() * sizeof(ggml_fp16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_MAT_MIXED_F16in: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < hc.size(); i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        // Same K=1024 F16-accumulator tolerance as test_mul_mat_mixed.
+        if (!close_enough(hc[i], expected[i], 1e-1f, 1e-2f)) {
+            if (bad < 5) fprintf(stderr, "MUL_MAT_MIXED_F16in: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 i, hc[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MUL_MAT_MIXED_F16in: %d mismatches over %zu (max_abs_err=%f)\n",
+                bad, hc.size(), max_err);
+        return 1;
+    }
+    printf("MUL_MAT_MIXED_F16in: ok (%zu elements, max_abs_err=%f)\n", hc.size(), max_err);
+    return 0;
+}
+
 // MUL_MAT_ID smoke: MoE expert dispatch on a small tractable shape.
 //   as:  [K, M, n_expert]                F32 expert weights
 //   b:   [K, n_expert_used, n_tokens]    F32 input
@@ -1829,6 +1910,7 @@ int main() {
     rc |= test_rope(gcu);
     rc |= test_rope_f16(gcu);
     rc |= test_mul_mat_mixed(gcu);
+    rc |= test_mul_mat_mixed_f16in(gcu);
     rc |= test_mul_mat_id(gcu);
     rc |= test_mul_mat_id_f16(gcu);
     rc |= test_async_overlap(gcu);
