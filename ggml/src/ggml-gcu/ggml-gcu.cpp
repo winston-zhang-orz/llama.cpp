@@ -422,6 +422,23 @@ static topsatenDataType_t ggml_to_topsaten_dtype(ggml_type t) {
     }
 }
 
+// MVP-3a: Q-typed weight tensors are dequantized to F16 at set_tensor
+// time and stored as F16 on the device. This helper says which formats
+// we accept; non-supported Q-types fall back to CPU via supports_op.
+static bool gcu_q_supported(ggml_type t) {
+    return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K;
+}
+
+// Generic dequantize-to-F32 via ggml's per-type traits (libggml-base).
+// Works for any Q-type ggml supports; we use it only for those
+// gcu_q_supported() accepts.
+static void gcu_q_dequantize_to_f32(ggml_type type, const void * src,
+                                    float * dst, int64_t n_elem) {
+    const ggml_type_traits * tt = ggml_get_type_traits(type);
+    GGML_ASSERT(tt->to_float != nullptr);
+    tt->to_float(src, dst, n_elem);
+}
+
 // Per-tensor scratch for shape/stride arrays the topsatenSize_t pointers
 // must outlive. We carry them inline so the helper is self-contained.
 struct gcu_tensor_dims {
