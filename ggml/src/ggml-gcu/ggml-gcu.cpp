@@ -181,8 +181,9 @@ struct ggml_backend_gcu_context {
     int32_t      device      = 0;
     std::string  name;          // "GCU0", "GCU1", ...
     std::string  description;   // populated from topsGetDeviceProperties
-    topsStream_t stream        = nullptr;
-    gcu_pool     pool;          // declared after stream so it's destroyed first
+    topsStream_t compute_stream = nullptr;
+    topsStream_t copy_stream    = nullptr;
+    gcu_pool     pool;
 
     // Per-context zero-filled scratch used as bias for topsatenLinear's
     // mandatory bias parameter. Grows on demand to the largest output row
@@ -198,10 +199,21 @@ struct ggml_backend_gcu_context {
     size_t  ones_n0_bytes   = 0;
     int64_t ones_n0_count   = 0;
 
+    // MVP-4a: async H<->D plumbing.
+    // last_copy_event:    recorded on copy_stream after each set_tensor_async H->D enqueue
+    // last_compute_event: recorded on compute_stream at end of graph_compute
+    // copy_event_armed:   guards the first wait — recording-without-arming is undefined SDK behavior
+    topsEvent_t  last_copy_event    = nullptr;
+    topsEvent_t  last_compute_event = nullptr;
+    bool         copy_event_armed   = false;
+
     explicit ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
         TOPS_CHECK(topsSetDevice(device));
         gcu_global_init_inc();
-        TOPS_CHECK(topsStreamCreate(&stream));
+        TOPS_CHECK(topsStreamCreate(&compute_stream));
+        TOPS_CHECK(topsStreamCreate(&copy_stream));
+        TOPS_CHECK(topsEventCreate(&last_copy_event));
+        TOPS_CHECK(topsEventCreate(&last_compute_event));
 
         char buf[GGML_GCU_NAME_MAX];
         snprintf(buf, sizeof(buf), "GCU%d", device);
@@ -227,10 +239,23 @@ struct ggml_backend_gcu_context {
             zero_bias = nullptr;
             zero_bias_bytes = 0;
         }
-        if (stream) {
-            TOPS_CHECK(topsStreamSynchronize(stream));
-            TOPS_CHECK(topsStreamDestroy(stream));
-            stream = nullptr;
+        if (last_compute_event) {
+            TOPS_CHECK(topsEventDestroy(last_compute_event));
+            last_compute_event = nullptr;
+        }
+        if (last_copy_event) {
+            TOPS_CHECK(topsEventDestroy(last_copy_event));
+            last_copy_event = nullptr;
+        }
+        if (copy_stream) {
+            TOPS_CHECK(topsStreamSynchronize(copy_stream));
+            TOPS_CHECK(topsStreamDestroy(copy_stream));
+            copy_stream = nullptr;
+        }
+        if (compute_stream) {
+            TOPS_CHECK(topsStreamSynchronize(compute_stream));
+            TOPS_CHECK(topsStreamDestroy(compute_stream));
+            compute_stream = nullptr;
         }
         gcu_global_init_dec();
     }
@@ -471,7 +496,7 @@ static void ggml_backend_gcu_free(ggml_backend_t backend) {
 
 static void ggml_backend_gcu_synchronize(ggml_backend_t backend) {
     auto * ctx = (ggml_backend_gcu_context *) backend->context;
-    TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
 }
 
 // Forward declaration: gcu_compute_node lives in the Op dispatch section
@@ -491,7 +516,7 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
             return GGML_STATUS_FAILED;
         }
     }
-    TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
     return GGML_STATUS_SUCCESS;
 }
 
@@ -626,7 +651,7 @@ static bool gcu_op_add(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         scratch_bytes = ggml_nbytes(lhs_t);
         scratch       = ctx->pool.alloc(scratch_bytes);
         TOPS_CHECK(topsMemcpyAsync(scratch, lhs_data, scratch_bytes,
-                                   topsMemcpyDeviceToDevice, ctx->stream));
+                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
         lhs_data = scratch;
     }
 
@@ -649,13 +674,13 @@ static bool gcu_op_add(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         topsatenScalar_t alpha;
         alpha.dtype = TOPSATEN_DATA_FP32;
         alpha.fval  = 1.0;
-        TOPSATEN_CHECK(topsatenAdd(out, lhs, rhs, alpha, ctx->stream));
+        TOPSATEN_CHECK(topsatenAdd(out, lhs, rhs, alpha, ctx->compute_stream));
     }
 
     if (scratch) {
         // Synchronize before returning the scratch to the pool: the op is
         // queued on the stream and reading from scratch must complete.
-        TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
         ctx->pool.free(scratch, scratch_bytes);
     }
     return true;
@@ -672,7 +697,7 @@ static bool gcu_op_mul(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         scratch_bytes = ggml_nbytes(lhs_t);
         scratch       = ctx->pool.alloc(scratch_bytes);
         TOPS_CHECK(topsMemcpyAsync(scratch, lhs_data, scratch_bytes,
-                                   topsMemcpyDeviceToDevice, ctx->stream));
+                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
         lhs_data = scratch;
     }
 
@@ -691,11 +716,11 @@ static bool gcu_op_mul(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         topsatenTensor lhs(shape, stride, ggml_to_topsaten_dtype(lhs_t->type), lhs_data);
         topsatenTensor rhs = make_topsaten_tensor(rhs_t, drhs);
 
-        TOPSATEN_CHECK(topsatenMul(out, lhs, rhs, ctx->stream));
+        TOPSATEN_CHECK(topsatenMul(out, lhs, rhs, ctx->compute_stream));
     }
 
     if (scratch) {
-        TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
         ctx->pool.free(scratch, scratch_bytes);
     }
     return true;
@@ -716,7 +741,7 @@ static bool gcu_op_scale(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         scratch_bytes = ggml_nbytes(lhs_t);
         scratch       = ctx->pool.alloc(scratch_bytes);
         TOPS_CHECK(topsMemcpyAsync(scratch, lhs_data, scratch_bytes,
-                                   topsMemcpyDeviceToDevice, ctx->stream));
+                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
         lhs_data = scratch;
     }
 
@@ -737,11 +762,11 @@ static bool gcu_op_scale(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         topsatenScalar_t s;
         s.dtype = TOPSATEN_DATA_FP32;
         s.fval  = scale;
-        TOPSATEN_CHECK(topsatenMul(out, lhs, s, ctx->stream));
+        TOPSATEN_CHECK(topsatenMul(out, lhs, s, ctx->compute_stream));
     }
 
     if (scratch) {
-        TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
         ctx->pool.free(scratch, scratch_bytes);
     }
     return true;
@@ -757,7 +782,7 @@ static void * gcu_get_zero_bias(ggml_backend_gcu_context * ctx, size_t n_bytes) 
         }
         ctx->zero_bias       = ctx->pool.alloc(n_bytes);
         ctx->zero_bias_bytes = n_bytes;
-        TOPS_CHECK(topsMemsetAsync(ctx->zero_bias, 0, n_bytes, ctx->stream));
+        TOPS_CHECK(topsMemsetAsync(ctx->zero_bias, 0, n_bytes, ctx->compute_stream));
     }
     return ctx->zero_bias;
 }
@@ -775,7 +800,7 @@ static void * gcu_get_ones_f32(ggml_backend_gcu_context * ctx, int64_t count) {
     ctx->ones_n0_count = count;
 
     // Materialize ones: zero the buffer, then add scalar 1.0 broadcast.
-    TOPS_CHECK(topsMemsetAsync(ctx->ones_n0, 0, bytes, ctx->stream));
+    TOPS_CHECK(topsMemsetAsync(ctx->ones_n0, 0, bytes, ctx->compute_stream));
     int64_t dims[1] = { count };
     int64_t strs[1] = { 1 };
     topsatenTensor t(topsatenSize_t(dims, 1), topsatenSize_t(strs, 1),
@@ -783,7 +808,7 @@ static void * gcu_get_ones_f32(ggml_backend_gcu_context * ctx, int64_t count) {
     topsatenScalar_t one_lhs; one_lhs.dtype = TOPSATEN_DATA_FP32; one_lhs.fval = 1.0;
     topsatenScalar_t alpha;   alpha.dtype   = TOPSATEN_DATA_FP32; alpha.fval   = 1.0;
     // t = 1.0 + 1.0 * t (where t is currently 0) → t becomes 1.0
-    TOPSATEN_CHECK(topsatenAdd(t, one_lhs, t, alpha, ctx->stream));
+    TOPSATEN_CHECK(topsatenAdd(t, one_lhs, t, alpha, ctx->compute_stream));
     return ctx->ones_n0;
 }
 
@@ -815,7 +840,7 @@ static bool gcu_op_rms_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
                              TOPSATEN_DATA_FP16, cast_buf);
         topsatenDataType_t target = TOPSATEN_DATA_FP16;
         TOPSATEN_CHECK(topsatenTo(f16_t, f32_t, target, false, true,
-                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->stream));
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
         gamma_data  = cast_buf;
         gamma_dtype = TOPSATEN_DATA_FP16;
     }
@@ -838,10 +863,10 @@ static bool gcu_op_rms_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 
     topsatenScalar_t eps_s; eps_s.dtype = TOPSATEN_DATA_FP32; eps_s.fval = eps;
 
-    TOPSATEN_CHECK(topsvllmRmsNorm(out_t, in_t, gamma_t, eps_s, ctx->stream));
+    TOPSATEN_CHECK(topsvllmRmsNorm(out_t, in_t, gamma_t, eps_s, ctx->compute_stream));
 
     if (cast_buf) {
-        TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
         ctx->pool.free(cast_buf, cast_bytes);
     }
     return true;
@@ -910,7 +935,7 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         int64_t bias_s[1] = { 1 };
         topsatenTensor bias(topsatenSize_t(bias_d, 1), topsatenSize_t(bias_s, 1),
                             ggml_to_topsaten_dtype(ot), bias_dev);
-        TOPSATEN_CHECK(topsatenLinear(out, lhs, rhs, bias, ctx->stream));
+        TOPSATEN_CHECK(topsatenLinear(out, lhs, rhs, bias, ctx->compute_stream));
         return true;
     }
 
@@ -937,7 +962,7 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
                              TOPSATEN_DATA_FP16, x_cast);
         topsatenDataType_t target = TOPSATEN_DATA_FP16;
         TOPSATEN_CHECK(topsatenTo(x_f16, x_f32, target, false, true,
-                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->stream));
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
         x_data = x_cast;
     }
 
@@ -970,7 +995,7 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     topsatenTensor bias_f16(topsatenSize_t(bias_d, 1), topsatenSize_t(bias_s, 1),
                             TOPSATEN_DATA_FP16, bias_dev);
 
-    TOPSATEN_CHECK(topsatenLinear(out_f16, lhs_f16, rhs_f16, bias_f16, ctx->stream));
+    TOPSATEN_CHECK(topsatenLinear(out_f16, lhs_f16, rhs_f16, bias_f16, ctx->compute_stream));
 
     // Cast output F16 -> dst dtype if needed.
     if (ot == GGML_TYPE_F32) {
@@ -979,13 +1004,13 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
                                TOPSATEN_DATA_FP32, dst->data);
         topsatenDataType_t target = TOPSATEN_DATA_FP32;
         TOPSATEN_CHECK(topsatenTo(out_f32, out_f16, target, false, true,
-                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->stream));
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
     } else {
         TOPS_CHECK(topsMemcpyAsync(dst->data, y_f16, y_f16_bytes,
-                                   topsMemcpyDeviceToDevice, ctx->stream));
+                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
     }
 
-    TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
     if (x_cast) ctx->pool.free(x_cast, x_cast_bytes);
     ctx->pool.free(y_f16, y_f16_bytes);
     return true;
@@ -1000,7 +1025,7 @@ static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     if (src->type == dst->type) {
         GGML_ASSERT(ggml_nbytes(src) == ggml_nbytes(dst));
         TOPS_CHECK(topsMemcpyAsync(dst->data, src->data, ggml_nbytes(src),
-                                   topsMemcpyDeviceToDevice, ctx->stream));
+                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
         return true;
     }
 
@@ -1012,7 +1037,7 @@ static bool gcu_op_cpy(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     topsatenDataType_t target = ggml_to_topsaten_dtype(dst->type);
     TOPSATEN_CHECK(topsatenTo(out_t, in_t, target,
                               /*non_blocking=*/false, /*copy=*/true,
-                              TOPSATEN_MEMORY_CONTIGUOUS, ctx->stream));
+                              TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
     return true;
 }
 
@@ -1067,7 +1092,7 @@ static bool gcu_op_set_rows(ggml_backend_gcu_context * ctx, ggml_tensor * node) 
         topsatenDataType_t target = ggml_to_topsaten_dtype(dst->type);
         TOPSATEN_CHECK(topsatenTo(cast_view, src_view, target,
                                   /*non_blocking=*/false, /*copy=*/true,
-                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->stream));
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
         src_data = cast_buf;
     }
 
@@ -1093,11 +1118,11 @@ static bool gcu_op_set_rows(ggml_backend_gcu_context * ctx, ggml_tensor * node) 
         TOPS_CHECK(topsMemcpyAsync(dst_base + (size_t) dst_row * row_size,
                                    src_base + (size_t) i * row_size,
                                    row_size,
-                                   topsMemcpyDeviceToDevice, ctx->stream));
+                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
     }
 
     if (cast_buf) {
-        TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
         ctx->pool.free(cast_buf, cast_bytes);
     }
     return true;
@@ -1131,7 +1156,7 @@ static bool gcu_op_get_rows(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     topsatenSize_t idx_stride(idx_strs, 1);
     topsatenTensor idx_tt(idx_shape, idx_stride, TOPSATEN_DATA_I32, idx_t->data);
 
-    TOPSATEN_CHECK(topsatenIndexSelect(out_tt, in_tt, /*dim=*/0, idx_tt, ctx->stream));
+    TOPSATEN_CHECK(topsatenIndexSelect(out_tt, in_tt, /*dim=*/0, idx_tt, ctx->compute_stream));
     return true;
 }
 
@@ -1210,29 +1235,29 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         std::vector<ggml_fp16_t> cs_f16(cs_host.size());
         ggml_fp32_to_fp16_row(cs_host.data(), cs_f16.data(), (int64_t) cs_host.size());
         TOPS_CHECK(topsMemcpyAsync(cs_dev, cs_f16.data(), cs_bytes,
-                                   topsMemcpyHostToDevice, ctx->stream));
+                                   topsMemcpyHostToDevice, ctx->compute_stream));
     } else {
         TOPS_CHECK(topsMemcpyAsync(cs_dev, cs_host.data(), cs_bytes,
-                                   topsMemcpyHostToDevice, ctx->stream));
+                                   topsMemcpyHostToDevice, ctx->compute_stream));
     }
     std::vector<int64_t> pos_i64(n_tokens);
     for (int64_t i = 0; i < n_tokens; i++) pos_i64[i] = (int64_t) pos_host[i];
     TOPS_CHECK(topsMemcpyAsync(pos_dev, pos_i64.data(), pos_bytes,
-                               topsMemcpyHostToDevice, ctx->stream));
+                               topsMemcpyHostToDevice, ctx->compute_stream));
 
     // topsvllmRotaryEmbedding rotates query in-place. For ggml's non-inplace
     // ROPE (dst is a fresh tensor distinct from x), copy x into dst first so
     // we can rotate dst safely without touching x.
     if (dst->data != x->data) {
         TOPS_CHECK(topsMemcpyAsync(dst->data, x->data, ggml_nbytes(x),
-                                   topsMemcpyDeviceToDevice, ctx->stream));
+                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
     }
 
     // Dummy key tensor — small, zero, just to satisfy topsvllmRotaryEmbedding's
     // dual-tensor signature. Shape [n_tokens, head_dim].
     const size_t dummy_bytes = (size_t) n_tokens * head_dim * ggml_type_size(x->type);
     void * dummy_key_dev = ctx->pool.alloc(dummy_bytes);
-    TOPS_CHECK(topsMemsetAsync(dummy_key_dev, 0, dummy_bytes, ctx->stream));
+    TOPS_CHECK(topsMemsetAsync(dummy_key_dev, 0, dummy_bytes, ctx->compute_stream));
 
     // query: [n_tokens, n_heads * head_dim] over dst's memory (rotated in place).
     int64_t q_d[2] = { n_tokens, n_heads * head_dim };
@@ -1257,9 +1282,9 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 
     TOPSATEN_CHECK(topsvllmRotaryEmbedding(q_tt, k_tt, pos_tt, cs_tt,
                                            (int) head_dim, /*is_neox=*/false,
-                                           ctx->stream));
+                                           ctx->compute_stream));
 
-    TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
     ctx->pool.free(cs_dev,        cs_bytes);
     ctx->pool.free(pos_dev,       pos_bytes);
     ctx->pool.free(dummy_key_dev, dummy_bytes);
@@ -1300,21 +1325,21 @@ static bool gcu_op_soft_max(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     // scratch = x * scale
     {
         topsatenScalar_t s; s.dtype = TOPSATEN_DATA_FP32; s.fval = scale;
-        TOPSATEN_CHECK(topsatenMul(scratch_t, x_t, s, ctx->stream));
+        TOPSATEN_CHECK(topsatenMul(scratch_t, x_t, s, ctx->compute_stream));
     }
 
     // scratch += mask (with alpha=1)
     if (mask) {
         topsatenTensor mask_t = make_topsaten_tensor(mask, d_mask);
         topsatenScalar_t alpha; alpha.dtype = TOPSATEN_DATA_FP32; alpha.fval = 1.0;
-        TOPSATEN_CHECK(topsatenAdd(scratch_t, scratch_t, mask_t, alpha, ctx->stream));
+        TOPSATEN_CHECK(topsatenAdd(scratch_t, scratch_t, mask_t, alpha, ctx->compute_stream));
     }
 
     // out = softmax(scratch, dim=last)
     int rank = ggml_n_dims(dst); if (rank < 1) rank = 1;
-    TOPSATEN_CHECK(topsatenSoftmaxForward(out_t, scratch_t, rank - 1, ctx->stream));
+    TOPSATEN_CHECK(topsatenSoftmaxForward(out_t, scratch_t, rank - 1, ctx->compute_stream));
 
-    TOPS_CHECK(topsStreamSynchronize(ctx->stream));
+    TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
     ctx->pool.free(scratch, bytes);
     return true;
 }
@@ -1325,7 +1350,7 @@ static bool gcu_op_silu(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     gcu_tensor_dims dout, dlhs;
     topsatenTensor out = make_topsaten_tensor(dst, dout);
     topsatenTensor in  = make_topsaten_tensor(src, dlhs);
-    TOPSATEN_CHECK(topsatenSilu(out, in, ctx->stream));
+    TOPSATEN_CHECK(topsatenSilu(out, in, ctx->compute_stream));
     return true;
 }
 
