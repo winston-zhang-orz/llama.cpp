@@ -520,11 +520,71 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
     return GGML_STATUS_SUCCESS;
 }
 
+// MVP-4a: async H<->D on copy_stream. The synchronous buffer-level
+// set_tensor (which carries the Q-typed dequant path) is left intact —
+// only F32/F16 activation and KV traffic flows through here.
+//
+// GGML_GCU_NO_ASYNC_COPY=1 falls back to a synchronous topsMemcpy and
+// skips event arming, mirroring the GGML_GCU_NO_PINNED rollback switch.
+
+static bool gcu_async_disabled() {
+    return getenv("GGML_GCU_NO_ASYNC_COPY") != nullptr;
+}
+
+static void ggml_backend_gcu_set_tensor_async(
+        ggml_backend_t backend, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    if (size == 0) return;
+
+    // Q-typed weights load via the synchronous buffer path at model init
+    // and are never re-set during inference. Reaching here with a Q-tensor
+    // is a logic bug — silently mis-sizing the copy would corrupt the
+    // dequanted F16 destination.
+    GGML_ASSERT(!ggml_is_quantized(tensor->type));
+
+    auto * ctx = (ggml_backend_gcu_context *) backend->context;
+    TOPS_CHECK(topsSetDevice(ctx->device));
+
+    if (gcu_async_disabled()) {
+        TOPS_CHECK(topsMemcpy((char *) tensor->data + offset, data, size,
+                              topsMemcpyHostToDevice));
+        return;
+    }
+
+    TOPS_CHECK(topsMemcpyAsync(
+        (char *) tensor->data + offset, data, size,
+        topsMemcpyHostToDevice, ctx->copy_stream));
+    TOPS_CHECK(topsEventRecord(ctx->last_copy_event, ctx->copy_stream));
+    ctx->copy_event_armed = true;
+}
+
+static void ggml_backend_gcu_get_tensor_async(
+        ggml_backend_t backend, const ggml_tensor * tensor,
+        void * data, size_t offset, size_t size) {
+    if (size == 0) return;
+    GGML_ASSERT(!ggml_is_quantized(tensor->type));
+
+    auto * ctx = (ggml_backend_gcu_context *) backend->context;
+    TOPS_CHECK(topsSetDevice(ctx->device));
+
+    if (gcu_async_disabled()) {
+        TOPS_CHECK(topsMemcpy(data, (const char *) tensor->data + offset, size,
+                              topsMemcpyDeviceToHost));
+        return;
+    }
+
+    // D->H must not race still-running compute.
+    TOPS_CHECK(topsStreamWaitEvent(ctx->copy_stream, ctx->last_compute_event, 0));
+    TOPS_CHECK(topsMemcpyAsync(
+        data, (const char *) tensor->data + offset, size,
+        topsMemcpyDeviceToHost, ctx->copy_stream));
+}
+
 static const ggml_backend_i ggml_backend_gcu_i = {
     /* .get_name             = */ ggml_backend_gcu_name,
     /* .free                 = */ ggml_backend_gcu_free,
-    /* .set_tensor_async     = */ nullptr,
-    /* .get_tensor_async     = */ nullptr,
+    /* .set_tensor_async     = */ ggml_backend_gcu_set_tensor_async,
+    /* .get_tensor_async     = */ ggml_backend_gcu_get_tensor_async,
     /* .set_tensor_2d_async  = */ nullptr,
     /* .get_tensor_2d_async  = */ nullptr,
     /* .cpy_tensor_async     = */ nullptr,
