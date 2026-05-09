@@ -14,6 +14,7 @@
 #include "ggml-gcu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1058,6 +1059,266 @@ static int test_async_overlap(ggml_backend_t gcu) {
     return 0;
 }
 
+// === Per-op perf micro-bench ============================================
+//
+// Opt-in via environment: GCU_BENCH=1 ./test-backend-gcu. When unset,
+// the bench section is skipped and the smoke run finishes in seconds.
+// Each bench builds an isolated graph for one op, runs warmup iterations
+// to settle, then times a fixed number of synchronous graph_compute calls
+// and reports mean ± stddev wall time. Shapes target a typical decode-step
+// (n_tokens = 1) at hidden_dim = 4096 / FFN = 11008 — close to a Llama
+// 7B-class layer.
+
+static void time_graph(ggml_backend_t gcu, ggml_cgraph * graph, const char * label,
+                       int n_warmup, int n_iter) {
+    using clock = std::chrono::steady_clock;
+
+    for (int i = 0; i < n_warmup; i++) {
+        ggml_backend_graph_compute(gcu, graph);
+    }
+    ggml_backend_synchronize(gcu);
+
+    std::vector<double> times_ms;
+    times_ms.reserve(n_iter);
+    for (int i = 0; i < n_iter; i++) {
+        auto t0 = clock::now();
+        ggml_backend_graph_compute(gcu, graph);
+        ggml_backend_synchronize(gcu);
+        auto t1 = clock::now();
+        times_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+
+    double sum = 0.0;
+    for (double t : times_ms) sum += t;
+    double mean = sum / n_iter;
+    double sq_sum = 0.0;
+    for (double t : times_ms) sq_sum += (t - mean) * (t - mean);
+    double stddev = std::sqrt(sq_sum / n_iter);
+
+    printf("BENCH %-22s mean=%7.3f ms  std=%6.3f ms  (n=%d)\n",
+           label, mean, stddev, n_iter);
+}
+
+// Helper: standard ggml_init params used by every bench.
+static ggml_init_params bench_init_params() {
+    return {
+        /* .mem_size   = */ ggml_tensor_overhead() * 64 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+}
+
+static void bench_add_f32(ggml_backend_t gcu) {
+    const int64_t M = 4096, N = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_add(ctx, a, b);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) M * N), hb((size_t) M * N);
+        fill_random_f32(ha.data(), ha.size(), 101);
+        fill_random_f32(hb.data(), hb.size(), 102);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_backend_tensor_set(b, hb.data(), 0, hb.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph(gcu, graph, "ADD F32 [4096,4096]", 3, 10);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+static void bench_rms_norm_f32(ggml_backend_t gcu) {
+    const int64_t M = 4096, N = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_rms_norm(ctx, a, 1e-5f);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) M * N);
+        fill_random_f32(ha.data(), ha.size(), 111);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph(gcu, graph, "RMS_NORM F32 [4096,1]", 3, 20);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+static void bench_softmax_f32(ggml_backend_t gcu) {
+    // Shape mirrors decode-step attention scores: [n_kv=128, n_head=32, n=1].
+    const int64_t n_kv = 128, n_head = 32, n_tokens = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_head, n_tokens);
+    ggml_tensor * c = ggml_soft_max(ctx, a);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) n_kv * n_head * n_tokens);
+        fill_random_f32(ha.data(), ha.size(), 121);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph(gcu, graph, "SOFT_MAX F32 [128,32,1]", 3, 20);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+static void bench_silu_f32(ggml_backend_t gcu) {
+    const int64_t M = 11008, N = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_silu(ctx, a);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) M * N);
+        fill_random_f32(ha.data(), ha.size(), 131);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph(gcu, graph, "SILU F32 [11008,1]", 3, 20);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+static void bench_rope_f32(ggml_backend_t gcu) {
+    // [head_dim=128, n_head=32, n_tokens=1]
+    const int64_t head_dim = 128, n_head = 32, n_tokens = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * c   = ggml_rope(ctx, a, pos, head_dim, /*mode=*/0);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float>   ha((size_t) head_dim * n_head * n_tokens);
+        std::vector<int32_t> hp(n_tokens);
+        fill_random_f32(ha.data(), ha.size(), 141);
+        for (int64_t i = 0; i < n_tokens; i++) hp[i] = (int32_t) i;
+        ggml_backend_tensor_set(a,   ha.data(), 0, ha.size() * sizeof(float));
+        ggml_backend_tensor_set(pos, hp.data(), 0, hp.size() * sizeof(int32_t));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph(gcu, graph, "ROPE F32 [128,32,1]", 3, 20);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// MUL_MAT F16 weight × F32 input → F32 output. K=4096 M=4096 N=1
+// matches a Llama-7B-class projection on a single decode step.
+static void bench_mul_mat_f16(ggml_backend_t gcu) {
+    const int64_t K = 4096, M = 4096, N = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, M);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * c = ggml_mul_mat(ctx, w, x);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float>       w_f32((size_t) K * M);
+        std::vector<ggml_fp16_t> w_f16((size_t) K * M);
+        std::vector<float>       hx((size_t) K * N);
+        fill_random_f32(w_f32.data(), w_f32.size(), 151);
+        fill_random_f32(hx.data(),    hx.size(),    152);
+        ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), w_f16.size());
+        ggml_backend_tensor_set(w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(x, hx.data(),    0, hx.size()    * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph(gcu, graph, "MUL_MAT F16w [4096x4096x1]", 5, 20);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// MUL_MAT Q4_K weight × F32 input → F32 output, decode-step shape.
+// Mirrors what GGUF Q4_K_M models hit on every projection.
+static void bench_mul_mat_q4_k(ggml_backend_t gcu) {
+    const int64_t K = 4096, M = 4096, N = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, K, M);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  K, N);
+    ggml_tensor * c = ggml_mul_mat(ctx, w, x);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float>   w_f32((size_t) K * M);
+        std::vector<uint8_t> w_q(M * ggml_row_size(GGML_TYPE_Q4_K, K));
+        std::vector<float>   hx((size_t) K * N);
+        fill_random_f32(w_f32.data(), w_f32.size(), 161);
+        fill_random_f32(hx.data(),    hx.size(),    162);
+        ggml_quantize_chunk(GGML_TYPE_Q4_K, w_f32.data(), w_q.data(), 0, M, K, nullptr);
+        ggml_backend_tensor_set(w, w_q.data(), 0, w_q.size());
+        ggml_backend_tensor_set(x, hx.data(),  0, hx.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph(gcu, graph, "MUL_MAT Q4_Kw [4096x4096x1]", 5, 20);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// MUL_MAT_ID at MoE decode-step shape. K=4096 M=11008 (FFN intermediate)
+// with 8 experts and 2 active per token.
+static void bench_mul_mat_id_f16(ggml_backend_t gcu) {
+    const int64_t K = 4096, M = 11008;
+    const int64_t n_expert = 8, n_used = 2, n_tokens = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * w   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, M, n_expert);
+    ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_used, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+    ggml_tensor * c   = ggml_mul_mat_id(ctx, w, b, ids);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float>       w_f32((size_t) K * M * n_expert);
+        std::vector<ggml_fp16_t> w_f16((size_t) K * M * n_expert);
+        std::vector<float>       hb((size_t) K * n_used * n_tokens);
+        std::vector<int32_t>     hids((size_t) n_used * n_tokens);
+        fill_random_f32(w_f32.data(), w_f32.size(), 171);
+        fill_random_f32(hb.data(),    hb.size(),    172);
+        ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), w_f16.size());
+        for (size_t i = 0; i < hids.size(); i++) hids[i] = (int32_t) (i % n_expert);
+        ggml_backend_tensor_set(w,   w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(b,   hb.data(),    0, hb.size()    * sizeof(float));
+        ggml_backend_tensor_set(ids, hids.data(),  0, hids.size()  * sizeof(int32_t));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph(gcu, graph, "MUL_MAT_ID F16w MoE", 5, 20);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+static void bench_all(ggml_backend_t gcu) {
+    if (getenv("GCU_BENCH") == nullptr) return;
+    printf("---- per-op micro-bench (decode-step shapes; warmup+timed) ----\n");
+    bench_add_f32(gcu);
+    bench_rms_norm_f32(gcu);
+    bench_softmax_f32(gcu);
+    bench_silu_f32(gcu);
+    bench_rope_f32(gcu);
+    bench_mul_mat_f16(gcu);
+    bench_mul_mat_q4_k(gcu);
+    bench_mul_mat_id_f16(gcu);
+}
+
 int main() {
     if (ggml_backend_gcu_get_device_count() < 1) {
         fprintf(stderr, "no GCU device found\n");
@@ -1092,6 +1353,9 @@ int main() {
     rc |= test_mul_mat_id(gcu);
     rc |= test_async_overlap(gcu);
 
+    const bool bench_ran = (rc == 0 && getenv("GCU_BENCH") != nullptr);
+    if (bench_ran) bench_all(gcu);
+
     ggml_backend_free(gcu);
 
     size_t free_after = 0, total_after = 0;
@@ -1100,12 +1364,16 @@ int main() {
     // The pool, the cached zero-bias, and topsaten's own workspace all
     // outlive a backend instance (heap-leaked singletons; OS reclaims at
     // exit). So a strict leak check would always trip. Print the delta
-    // as info, and only flag truly extreme values (>1 GiB) as failure.
+    // as info, and only flag truly extreme values as failure. The bench
+    // section legitimately loads ~1 GiB of MoE-shape weight scratch into
+    // the pool, so raise the threshold when bench mode ran.
     if (total_after == total_before && free_before > free_after) {
         size_t diff = free_before - free_after;
         printf("retained device memory: %zu bytes (pool + topsaten workspace)\n", diff);
-        if (diff > ((size_t) 1 << 30)) {
-            fprintf(stderr, "leak detected: %zu bytes retained (>1 GiB)\n", diff);
+        const size_t leak_threshold = bench_ran ? ((size_t) 4 << 30) : ((size_t) 1 << 30);
+        if (diff > leak_threshold) {
+            fprintf(stderr, "leak detected: %zu bytes retained (>%zu GiB)\n",
+                    diff, leak_threshold >> 30);
             rc |= 1;
         }
     }
