@@ -1133,13 +1133,26 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     std::vector<float> cs_host;
     gcu_build_rope_cos_sin_host(n_dims, max_pos, freq_base, freq_scale, cs_host);
 
-    const size_t cs_bytes  = cs_host.size() * sizeof(float);
+    // The SDK requires cos_sin_cache.dtype == query.dtype on this arch
+    // (see op_vllm_rotary_embedding.h:188 — the FP32-cs override only
+    // applies when the runtime check IS satisfied, but we observed NaN
+    // empirically for F16 query + F32 cs). Pack to F16 if query is F16.
+    const bool   cs_is_f16 = (x->type == GGML_TYPE_F16);
+    const size_t cs_bpe    = cs_is_f16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t cs_bytes  = cs_host.size() * cs_bpe;
     const size_t pos_bytes = (size_t) n_tokens * sizeof(int64_t);
     void * cs_dev  = ctx->pool.alloc(cs_bytes);
     void * pos_dev = ctx->pool.alloc(pos_bytes);
 
-    TOPS_CHECK(topsMemcpyAsync(cs_dev, cs_host.data(), cs_bytes,
-                               topsMemcpyHostToDevice, ctx->stream));
+    if (cs_is_f16) {
+        std::vector<ggml_fp16_t> cs_f16(cs_host.size());
+        ggml_fp32_to_fp16_row(cs_host.data(), cs_f16.data(), (int64_t) cs_host.size());
+        TOPS_CHECK(topsMemcpyAsync(cs_dev, cs_f16.data(), cs_bytes,
+                                   topsMemcpyHostToDevice, ctx->stream));
+    } else {
+        TOPS_CHECK(topsMemcpyAsync(cs_dev, cs_host.data(), cs_bytes,
+                                   topsMemcpyHostToDevice, ctx->stream));
+    }
     std::vector<int64_t> pos_i64(n_tokens);
     for (int64_t i = 0; i < n_tokens; i++) pos_i64[i] = (int64_t) pos_host[i];
     TOPS_CHECK(topsMemcpyAsync(pos_dev, pos_i64.data(), pos_bytes,
@@ -1178,7 +1191,7 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     int64_t cs_d[2] = { max_pos, n_dims };
     int64_t cs_s[2] = { n_dims, 1 };
     topsatenTensor cs_tt(topsatenSize_t(cs_d, 2), topsatenSize_t(cs_s, 2),
-                         TOPSATEN_DATA_FP32, cs_dev);
+                         cs_is_f16 ? TOPSATEN_DATA_FP16 : TOPSATEN_DATA_FP32, cs_dev);
 
     TOPSATEN_CHECK(topsvllmRotaryEmbedding(q_tt, k_tt, pos_tt, cs_tt,
                                            (int) head_dim, /*is_neox=*/false,
@@ -1510,9 +1523,11 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             return true;
         }
         case GGML_OP_ROPE: {
-            // MVP-2: F32 only. F16 inputs produce NaN with our F32 cos/sin
-            // table on this SDK version; revisit in MVP-3 with matched dtypes.
-            if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+            // MVP-3c: F32 + F16 supported. F16 builds the cos/sin table in
+            // F16 to satisfy the SDK's same-dtype requirement
+            // (op_vllm_rotary_embedding.h:188).
+            if (!gcu_dtype_supported(op->src[0]->type)) return false;
+            if (op->src[0]->type != op->type) return false;
             if (!op->src[1] || op->src[1]->type != GGML_TYPE_I32) return false;
             const int32_t mode = ((const int32_t *) op->op_params)[2];
             float ext_factor, attn_factor;
