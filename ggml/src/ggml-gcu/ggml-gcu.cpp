@@ -977,56 +977,62 @@ static bool gcu_op_set_rows(ggml_backend_gcu_context * ctx, ggml_tensor * node) 
     ggml_tensor * idx = node->src[1];
     ggml_tensor * dst = node->src[2];
 
-    auto flat_2d = [](const ggml_tensor * t, int64_t (& d)[2], int64_t (& s)[2]) {
-        d[0] = t->ne[1] * t->ne[2] * t->ne[3];
-        d[1] = t->ne[0];
-        s[0] = d[1];
-        s[1] = 1;
-    };
+    // MVP-3b strategy: bypass topsatenIndexPut (which rejects ggml's KV
+    // cache shapes at runtime) and write each row with a manual D2D
+    // memcpy. The indices live on device so we read them to host first,
+    // then issue n_rows memcpyAsync calls. Cheap for typical token counts
+    // (1 for decode, ~prompt_len for prefill).
 
-    int64_t self_d[2], self_s[2];
-    int64_t val_d[2],  val_s[2];
-    flat_2d(dst, self_d, self_s);
-    flat_2d(src, val_d,  val_s);
+    const int64_t n_rows   = idx->ne[0];
+    const size_t  row_size = (size_t) dst->ne[0] * ggml_type_size(dst->type);
 
-    topsatenTensor self_t(topsatenSize_t(self_d, 2), topsatenSize_t(self_s, 2),
-                          ggml_to_topsaten_dtype(dst->type), dst->data);
-
-    // If src and dst differ in dtype, cast src into a scratch buffer in
-    // dst's dtype before IndexPut.
-    void *  cast_buf       = nullptr;
-    size_t  cast_bytes     = 0;
-    void *  src_data       = src->data;
-    topsatenDataType_t src_dtype_topsaten = ggml_to_topsaten_dtype(src->type);
+    // If src and dst differ in dtype, cast src to dst dtype into a
+    // scratch first; then we memcpy from the scratch.
+    void * cast_buf = nullptr;
+    size_t cast_bytes = 0;
+    const void * src_data = src->data;
     if (src->type != dst->type) {
-        const int64_t n_elem = val_d[0] * val_d[1];
+        const int64_t n_elem = n_rows * dst->ne[0];
         cast_bytes = (size_t) n_elem * ggml_type_size(dst->type);
         cast_buf   = ctx->pool.alloc(cast_bytes);
 
-        topsatenTensor src_view(topsatenSize_t(val_d, 2), topsatenSize_t(val_s, 2),
-                                src_dtype_topsaten, src->data);
-        topsatenTensor cast_view(topsatenSize_t(val_d, 2), topsatenSize_t(val_s, 2),
+        int64_t  v_d[2] = { n_rows, dst->ne[0] };
+        int64_t  v_s[2] = { dst->ne[0], 1 };
+        topsatenTensor src_view (topsatenSize_t(v_d, 2), topsatenSize_t(v_s, 2),
+                                 ggml_to_topsaten_dtype(src->type), src->data);
+        topsatenTensor cast_view(topsatenSize_t(v_d, 2), topsatenSize_t(v_s, 2),
                                  ggml_to_topsaten_dtype(dst->type), cast_buf);
         topsatenDataType_t target = ggml_to_topsaten_dtype(dst->type);
         TOPSATEN_CHECK(topsatenTo(cast_view, src_view, target,
                                   /*non_blocking=*/false, /*copy=*/true,
                                   TOPSATEN_MEMORY_CONTIGUOUS, ctx->stream));
-        src_data           = cast_buf;
-        src_dtype_topsaten = target;
+        src_data = cast_buf;
     }
 
-    topsatenTensor val_t(topsatenSize_t(val_d, 2), topsatenSize_t(val_s, 2),
-                         src_dtype_topsaten, src_data);
+    // Read indices to host. Both I32 and I64 supported; convert to int64
+    // uniformly for the addressing math.
+    std::vector<int64_t> idx_host(n_rows);
+    if (idx->type == GGML_TYPE_I32) {
+        std::vector<int32_t> idx_i32(n_rows);
+        TOPS_CHECK(topsMemcpy(idx_i32.data(), idx->data,
+                              (size_t) n_rows * sizeof(int32_t),
+                              topsMemcpyDeviceToHost));
+        for (int64_t i = 0; i < n_rows; i++) idx_host[i] = (int64_t) idx_i32[i];
+    } else {
+        TOPS_CHECK(topsMemcpy(idx_host.data(), idx->data,
+                              (size_t) n_rows * sizeof(int64_t),
+                              topsMemcpyDeviceToHost));
+    }
 
-    int64_t idx_d[1] = { idx->ne[0] };
-    int64_t idx_s[1] = { 1 };
-    topsatenDataType_t idx_dtype = (idx->type == GGML_TYPE_I64) ? TOPSATEN_DATA_I64
-                                                                : TOPSATEN_DATA_I32;
-    topsatenTensor idx_t(topsatenSize_t(idx_d, 1), topsatenSize_t(idx_s, 1),
-                         idx_dtype, idx->data);
-
-    std::vector<topsatenTensor> indices = { idx_t };
-    TOPSATEN_CHECK(topsatenIndexPut(self_t, indices, val_t, /*accumulate=*/false, ctx->stream));
+    char * dst_base = (char *) dst->data;
+    const char * src_base = (const char *) src_data;
+    for (int64_t i = 0; i < n_rows; i++) {
+        const int64_t dst_row = idx_host[i];
+        TOPS_CHECK(topsMemcpyAsync(dst_base + (size_t) dst_row * row_size,
+                                   src_base + (size_t) i * row_size,
+                                   row_size,
+                                   topsMemcpyDeviceToDevice, ctx->stream));
+    }
 
     if (cast_buf) {
         TOPS_CHECK(topsStreamSynchronize(ctx->stream));
@@ -1434,11 +1440,13 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!src || !idx || !dst) return false;
             if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) return false;
             if (!gcu_dtype_supported(src->type) || !gcu_dtype_supported(dst->type)) return false;
-            // MVP-2 explicit decision: F16 destination is the KV cache, and
-            // topsatenIndexPut returns NOT_SUPPORT at runtime for the cache
-            // shape on this SDK. Refuse F16 dst here so the scheduler routes
-            // those writes to CPU (and the cache buffer itself ends up CPU-
-            // resident). F32 dst stays accepted; same-dtype only.
+            // MVP-2 explicit decision: F16 destination is the KV cache.
+            // The MVP-3b probe (manual D2D memcpy loop bypassing
+            // topsatenIndexPut) was 2-5x slower than -nkvo because of
+            // per-call sync H2D index transfer. Refuse F16 dst here so
+            // KV cache stays on CPU; users pass -nkvo to opt in. F32 dst
+            // stays accepted for the small number of test-backend-ops
+            // cases that exercise it.
             if (dst->type != GGML_TYPE_F32) return false;
             if (src->type != dst->type) return false;
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) return false;
