@@ -979,6 +979,110 @@ static int test_cpy(ggml_backend_t gcu) {
     return 0;
 }
 
+// MUL_MAT_ID with F16 weight × F32 input → F32 output. This exercises
+// the F16-weight branch of gcu_op_mul_mat_id: input is cast to F16 once
+// up front and each per-(token, expert) call goes through topsatenLinear
+// in F16, with the F16 result cast back to F32 at the dst slot. This is
+// the same path Q-typed weights take after dequant-on-load.
+static int test_mul_mat_id_f16(ggml_backend_t gcu) {
+    const int64_t K = 256;
+    const int64_t M = 512;
+    const int64_t n_expert      = 4;
+    const int64_t n_expert_used = 2;
+    const int64_t n_tokens      = 8;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * as_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, M, n_expert);
+    ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_expert_used, n_tokens);
+    ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+    ggml_tensor * c    = ggml_mul_mat_id(ctx, as_w, b, ids);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL_MAT_ID_F16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       w_f32((size_t) K * M * n_expert);
+    std::vector<ggml_fp16_t> w_f16((size_t) K * M * n_expert);
+    std::vector<float>       h_b ((size_t) K * n_expert_used * n_tokens);
+    std::vector<int32_t>     h_ids((size_t) n_expert_used * n_tokens);
+    std::vector<float>       h_c ((size_t) M * n_expert_used * n_tokens);
+    std::vector<float>       expected((size_t) M * n_expert_used * n_tokens);
+
+    fill_random_f32(w_f32.data(), w_f32.size(), 261);
+    fill_random_f32(h_b.data(),   h_b.size(),   262);
+    ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), w_f16.size());
+
+    // Round-robin expert assignment (same as the F32 test) to exercise
+    // multiple experts per token.
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            h_ids[t * n_expert_used + e] = (int32_t) ((t + e * 2) % n_expert);
+        }
+    }
+
+    // CPU reference: dequant the F16 weight back to F32 (so we compare
+    // against what the device actually saw) and accumulate in F32.
+    std::vector<float> w_lossy((size_t) K * M * n_expert);
+    for (size_t i = 0; i < w_f16.size(); i++) {
+        w_lossy[i] = ggml_fp16_to_fp32(w_f16[i]);
+    }
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            const int32_t expert_id = h_ids[t * n_expert_used + e];
+            const float * w_mat = w_lossy.data() + (size_t) expert_id * M * K;
+            const float * b_vec = h_b.data()     + (size_t)(t * n_expert_used + e) * K;
+            float       * c_vec = expected.data() + (size_t)(t * n_expert_used + e) * M;
+            for (int64_t m = 0; m < M; m++) {
+                float acc = 0.0f;
+                const float * w_row = w_mat + m * K;
+                for (int64_t k = 0; k < K; k++) acc += w_row[k] * b_vec[k];
+                c_vec[m] = acc;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(as_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(b,    h_b.data(),   0, h_b.size()   * sizeof(float));
+    ggml_backend_tensor_set(ids,  h_ids.data(), 0, h_ids.size() * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_MAT_ID_F16: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, h_c.data(), 0, h_c.size() * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < h_c.size(); i++) {
+        const float err = std::fabs(h_c[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        // F16 weight × F32 input run through topsatenLinear's F16 path:
+        // expect F16-precision drift on a K=256 sum, comparable to the
+        // Q-weight tests above.
+        if (!close_enough(h_c[i], expected[i], 5e-2f, 1e-2f)) {
+            if (bad < 5) fprintf(stderr, "MUL_MAT_ID_F16: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 i, h_c[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MUL_MAT_ID_F16: %d mismatches over %zu (max_abs_err=%f)\n",
+                bad, h_c.size(), max_err);
+        return 1;
+    }
+    printf("MUL_MAT_ID_F16: ok (%zu elements, max_abs_err=%f)\n", h_c.size(), max_err);
+    return 0;
+}
+
 // === F16 dtype variants =================================================
 //
 // Mirror the existing F32 tests on F16 tensors. The reference is computed
@@ -1726,6 +1830,7 @@ int main() {
     rc |= test_rope_f16(gcu);
     rc |= test_mul_mat_mixed(gcu);
     rc |= test_mul_mat_id(gcu);
+    rc |= test_mul_mat_id_f16(gcu);
     rc |= test_async_overlap(gcu);
 
     const bool bench_ran = (rc == 0 && getenv("GCU_BENCH") != nullptr);
