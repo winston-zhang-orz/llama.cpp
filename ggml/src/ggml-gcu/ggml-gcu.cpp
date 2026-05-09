@@ -522,6 +522,8 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
     auto * ctx = (ggml_backend_gcu_context *) backend->context;
     TOPS_CHECK(topsSetDevice(ctx->device));
 
+    // MVP-4a: stitch any pending async H->D copies onto the compute stream
+    // so the first kernel here sees fully-transferred input.
     if (ctx->copy_event_armed) {
         TOPS_CHECK(topsStreamWaitEvent(ctx->compute_stream,
                                        ctx->last_copy_event, 0));
@@ -540,6 +542,8 @@ static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, s
         }
     }
 
+    // MVP-4a: arm the compute event so subsequent get_tensor_async can wait
+    // on it without blocking the host.
     TOPS_CHECK(topsEventRecord(ctx->last_compute_event, ctx->compute_stream));
     ctx->compute_event_armed = true;
     TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
