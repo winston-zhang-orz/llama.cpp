@@ -2058,20 +2058,23 @@ static void gcu_build_rope_cos_sin_host(int n_dims, int max_pos,
     }
 }
 
-// ROPE. Supports NORMAL (mode 0), NEOX (mode 2), and `freq_factors`
-// (op->src[2] — proportional rope, used by Gemma 4 full attention and
-// other YARN-style models).
-// YARN's full theta-mixing path (ext_factor != 0) and multi-axis modes
-// (MROPE/VISION/IMROPE) still fall back to CPU; partial rotation is
-// already correctness-tested under MVP-5b/2 and multi-axis is tracked in
-// MVP-5b/3-4.
+// ROPE. Supports NORMAL (mode 0), NEOX (mode 2), `freq_factors`, and
+// partial rotation. Multi-axis modes (MROPE / VISION / IMROPE) are wired
+// to topsvllmMRotaryEmbedding behind the `GGML_GCU_ENABLE_MROPE`
+// environment variable while we verify the SDK kernel's expected
+// position-tensor layout against ggml's [4 * n_tokens] axis-major layout
+// (see MVP-5b/3-4 spec). With the env unset they continue to fall back
+// to CPU as before MVP-5b.
+// YARN's full theta-mixing path (ext_factor != 0) still falls back to CPU.
 //
 // Inputs: x [head_dim, n_heads, n_tokens, 1] F32/F16/BF16;
-//         pos [n_tokens] I32;
+//         pos [n_tokens]  (NORMAL/NEOX) or [4*n_tokens] (MROPE/VISION/IMROPE)  I32;
 //         freq_factors [n_dims/2]  optional F32.
 // Maps to topsvllmRotaryEmbedding(query, key, positions, cos_sin_cache,
-//   head_size, is_neox, stream). is_neox=true rotates split halves
-// (NeoX/Phi style) instead of interleaved pairs.
+//   head_size, is_neox, stream) for NORMAL/NEOX, and
+// topsvllmMRotaryEmbedding(..., mrope_section, mrope_interleaved, stream)
+// for MROPE/VISION/IMROPE when the gate env is set. is_neox=true rotates
+// split halves (NeoX/Phi style) instead of interleaved pairs.
 // We treat x as the query; pass a small zero-filled scratch as key
 // (topsvllm rotates both; we ignore the dummy key result).
 // Positions get cast to I64 on host. cos_sin table is precomputed on host
@@ -2085,19 +2088,32 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 
     const int32_t n_dims = ((const int32_t *) dst->op_params)[1];
     const int32_t mode   = ((const int32_t *) dst->op_params)[2];
-    const bool    is_neox = (mode & GGML_ROPE_TYPE_NEOX) != 0;
+    const bool    is_neox  = (mode & GGML_ROPE_TYPE_NEOX) != 0;
+    const bool    is_mrope = (mode & GGML_ROPE_TYPE_MROPE) != 0;   // MROPE | VISION | IMROPE
+    const bool    is_vision = (mode == GGML_ROPE_TYPE_VISION);
+    const bool    is_imrope = (mode == GGML_ROPE_TYPE_IMROPE);
     float freq_base, freq_scale;
     memcpy(&freq_base,  (const int32_t *) dst->op_params + 5, sizeof(float));
     memcpy(&freq_scale, (const int32_t *) dst->op_params + 6, sizeof(float));
+    int32_t sections[4] = {0, 0, 0, 0};
+    memcpy(sections, (const int32_t *) dst->op_params + 11, sizeof(sections));
 
     const int64_t head_dim = x->ne[0];
     const int64_t n_heads  = x->ne[1];
     const int64_t n_tokens = x->ne[2];
     GGML_ASSERT(n_dims <= head_dim);
-    GGML_ASSERT(pos->ne[0] == n_tokens);
+    if (is_mrope) {
+        // ggml lays out positions as [4 * n_tokens] axis-major
+        // [T_0..T_n, H_0..H_n, W_0..W_n, E_0..E_n] (see
+        // ggml-cpu/ops.cpp:ggml_compute_forward_rope_flt where
+        // p_h = pos[i2 + ne2]).
+        GGML_ASSERT(pos->ne[0] == n_tokens * 4);
+    } else {
+        GGML_ASSERT(pos->ne[0] == n_tokens);
+    }
 
     // Read positions to host so we can determine max_pos and cast to I64.
-    const int64_t pos_count = n_tokens;
+    const int64_t pos_count = pos->ne[0];
     std::vector<int32_t> pos_host(pos_count);
     TOPS_CHECK(topsMemcpy(pos_host.data(), pos->data,
                           (size_t) pos_count * sizeof(int32_t),
@@ -2206,9 +2222,43 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     topsatenTensor cs_tt(topsatenSize_t(cs_d, 2), topsatenSize_t(cs_s, 2),
                          ggml_to_topsaten_dtype(x->type), cs_dev);
 
-    TOPSATEN_CHECK(topsvllmRotaryEmbedding(q_tt, k_tt, pos_tt, cs_tt,
-                                           (int) head_dim, is_neox,
-                                           ctx->compute_stream));
+    if (is_mrope) {
+        // MROPE / VISION / IMROPE — multi-axis (T, H, W, E) rotary.
+        // ggml header documents that MROPE/VISION always use NeoX
+        // ordering even when the NEOX bit is unset in `mode`.
+        // ggml header (ggml.h:1837): "NEOX ordering is automatically applied
+        // and cannot be disabled for MROPE and VISION".
+        const bool mrope_is_neox = true;
+        int64_t mrope_sec[4] = {
+            (int64_t) sections[0], (int64_t) sections[1],
+            (int64_t) sections[2], (int64_t) sections[3]
+        };
+        topsatenSize_t mrope_section_t(mrope_sec, 4);
+        // TODO(MVP-5b/3-4): the SDK header documents `positions: [num_tokens]`
+        // but ggml passes [4 * num_tokens]. The kernel layout is in
+        // dispute (axis-major vs token-major; 3 vs 4 axes). The
+        // smoke under `#if 0 // MVP-5b/3-4` in test-backend-gcu.cpp
+        // shows the GCU output diverging from CPU on MROPE; needs a
+        // direct probe (e.g. all-zero positions on each axis to see
+        // which slot the kernel reads). Until resolved, supports_op
+        // refuses MROPE so this branch is unreachable in practice.
+        if (is_imrope) {
+            TOPSATEN_CHECK(topsvllmMRotaryEmbedding(q_tt, k_tt, pos_tt, cs_tt,
+                                                    (int) head_dim, mrope_is_neox,
+                                                    mrope_section_t,
+                                                    /*mrope_interleaved=*/true,
+                                                    ctx->compute_stream));
+        } else {
+            TOPSATEN_CHECK(topsvllmMRotaryEmbedding(q_tt, k_tt, pos_tt, cs_tt,
+                                                    (int) head_dim, mrope_is_neox,
+                                                    mrope_section_t,
+                                                    ctx->compute_stream));
+        }
+    } else {
+        TOPSATEN_CHECK(topsvllmRotaryEmbedding(q_tt, k_tt, pos_tt, cs_tt,
+                                               (int) head_dim, is_neox,
+                                               ctx->compute_stream));
+    }
 
     gcu_release_scratch(ctx, cs_dev,        cs_bytes);
     gcu_release_scratch(ctx, pos_dev,       pos_bytes);
@@ -3536,8 +3586,11 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
         // enough at the small shapes these ops use).
         case GGML_OP_ROPE: {
             // MVP-3c (NORMAL+NEOX), MVP-5a (F16/BF16 cs), MVP-5b/1
-            // (freq_factors). Partial rotation, MROPE / VISION / IMROPE
-            // planned for MVP-5b/2-4.
+            // (freq_factors), MVP-5b/2 (partial rotation tested).
+            // MVP-5b/3-4: multi-axis modes (MROPE / VISION / IMROPE) are
+            // wired through the handler but gated behind the env var
+            // GGML_GCU_ENABLE_MROPE while we resolve the SDK position-
+            // layout discrepancy (see TODO in gcu_op_rope).
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
             if (!op->src[1] || op->src[1]->type != GGML_TYPE_I32) return false;
@@ -3545,9 +3598,20 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             float ext_factor, attn_factor;
             memcpy(&ext_factor,  (const int32_t *) op->op_params + 7, sizeof(float));
             memcpy(&attn_factor, (const int32_t *) op->op_params + 8, sizeof(float));
-            // NORMAL (0) and NEOX (2) supported; multi-axis modes still
-            // route to CPU until MVP-5b/3-4 lands the per-axis dispatch.
-            if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) return false;
+            // NORMAL (0) and NEOX (2) always supported. MROPE (8) /
+            // VISION (24) / IMROPE (40) gated behind env var; default
+            // off so multi-axis ROPE keeps falling back to CPU.
+            const int32_t known_mask = GGML_ROPE_TYPE_NORMAL |
+                                       GGML_ROPE_TYPE_NEOX   |
+                                       GGML_ROPE_TYPE_MROPE  |
+                                       GGML_ROPE_TYPE_VISION |
+                                       GGML_ROPE_TYPE_IMROPE;
+            if ((mode & ~known_mask) != 0) return false;
+            const bool is_mrope_mode = (mode & GGML_ROPE_TYPE_MROPE) != 0;
+            if (is_mrope_mode) {
+                static const bool enable_mrope = (getenv("GGML_GCU_ENABLE_MROPE") != nullptr);
+                if (!enable_mrope) return false;
+            }
             // YARN's full theta-mixing path stays on CPU; freq_factors-only
             // (Gemma 4 / GPT-OSS proportional rope) is supported via the
             // host-side cos/sin builder.

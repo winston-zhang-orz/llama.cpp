@@ -4181,6 +4181,229 @@ static int test_rope_partial(ggml_backend_t gcu) {
     return 0;
 }
 
+// MVP-5b/3-4: MROPE / VISION / IMROPE smokes. The handler is wired to
+// topsvllmMRotaryEmbedding (see ggml-gcu.cpp gcu_op_rope) and gated by
+// the env var `GGML_GCU_ENABLE_MROPE`. With the env unset, supports_op
+// refuses these modes and they keep falling back to CPU. The smokes are
+// `#if 0`d below because an initial run with axis-major position layout
+// `[T_0..T_n, H_0..H_n, W_0..W_n, E_0..E_n]` produced output that
+// diverges from the CPU reference (max_abs_err ~2.3 on a head_dim=64
+// shape). The likely root cause is that the SDK kernel expects a
+// different position layout than ggml's. To resume:
+//   1. Set GGML_GCU_ENABLE_MROPE=1 and flip the `#if 0` below to `#if 1`
+//   2. Run `./build/bin/test-backend-gcu` and inspect the first mismatch
+//   3. Probe layouts: try [num_tokens, 3] / [num_tokens, 4] / [3, n_t] /
+//      send only the T-axis vector / etc. The CPU forward at
+//      ggml-cpu/ops.cpp:5834-5841 (p_t = pos[i2], p_h = pos[i2 + ne2],
+//      p_w = pos[i2 + 2*ne2], p_e = pos[i2 + 3*ne2]) is the truth.
+//
+// All smokes use ggml_rope_multi to produce the dst tensor; reference
+// is ggml's CPU forward via a side context.
+
+#if 0   // re-enable once MVP-5b/3-4 lands the multi-axis dispatch
+static void mrope_reference_f32(int mode, int n_dims, int sections[GGML_MROPE_SECTIONS],
+                                float freq_base, int64_t head_dim, int64_t n_heads, int64_t n_tokens,
+                                const std::vector<int32_t> & pos_vec,
+                                const float * src, float * dst) {
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 16
+                            + ggml_graph_overhead()
+                            + (size_t)(head_dim * n_heads * n_tokens * sizeof(float)) * 2
+                            + (size_t)(n_tokens * 4 * sizeof(int32_t))
+                            + 16 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, n_tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens * 4);
+    ggml_tensor * c   = ggml_rope_multi(ctx, a, pos, /*c=*/nullptr, n_dims, sections,
+                                        mode, /*n_ctx_orig=*/0,
+                                        freq_base, /*freq_scale=*/1.0f,
+                                        /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
+                                        /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+    memcpy(a->data,   src,           (size_t) head_dim * n_heads * n_tokens * sizeof(float));
+    memcpy(pos->data, pos_vec.data(), (size_t) n_tokens * 4 * sizeof(int32_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    ggml_graph_compute_with_ctx(ctx, graph, /*n_threads=*/1);
+    memcpy(dst, c->data, (size_t) head_dim * n_heads * n_tokens * sizeof(float));
+    ggml_free(ctx);
+}
+
+static int test_rope_mrope(ggml_backend_t gcu) {
+    const int64_t head_dim = 64, n_heads = 4, n_tokens = 8;
+    const int     n_dims = (int) head_dim;
+    int sections[GGML_MROPE_SECTIONS] = { 8, 8, 16, 0 };  // sums to 32 = n_dims/2
+    const float   freq_base = 10000.0f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, n_tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens * 4);
+    ggml_tensor * c   = ggml_rope_multi(ctx, a, pos, /*c=*/nullptr, n_dims, sections,
+                                        GGML_ROPE_TYPE_MROPE, /*n_ctx_orig=*/0,
+                                        freq_base, /*freq_scale=*/1.0f,
+                                        /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
+                                        /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ROPE_MROPE: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    const size_t n = (size_t) head_dim * n_heads * n_tokens;
+    std::vector<float>   ha(n), hc(n), expected(n);
+    std::vector<int32_t> hp(n_tokens * 4);
+    fill_random_f32(ha.data(), n, 1709);
+    for (int64_t i = 0; i < n_tokens * 4; i++) hp[i] = (int32_t) (i % 17);
+
+    mrope_reference_f32(GGML_ROPE_TYPE_MROPE, n_dims, sections, freq_base,
+                        head_dim, n_heads, n_tokens, hp, ha.data(), expected.data());
+
+    ggml_backend_tensor_set(a,   ha.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(pos, hp.data(), 0, n_tokens * 4 * sizeof(int32_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ROPE_MROPE: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 2e-3f, 2e-3f)) {
+            if (bad < 5) fprintf(stderr, "ROPE_MROPE: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ROPE_MROPE: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("ROPE_MROPE: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
+// MVP-5b/4: IMROPE smoke. Same shape as MROPE but with mode=IMROPE
+// (interleaved sectioning).
+static int test_rope_imrope(ggml_backend_t gcu) {
+    const int64_t head_dim = 64, n_heads = 4, n_tokens = 8;
+    const int     n_dims = (int) head_dim;
+    int sections[GGML_MROPE_SECTIONS] = { 8, 8, 16, 0 };
+    const float   freq_base = 10000.0f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, n_tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens * 4);
+    ggml_tensor * c   = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections,
+                                        GGML_ROPE_TYPE_IMROPE, 0,
+                                        freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ROPE_IMROPE: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    const size_t n = (size_t) head_dim * n_heads * n_tokens;
+    std::vector<float>   ha(n), hc(n), expected(n);
+    std::vector<int32_t> hp(n_tokens * 4);
+    fill_random_f32(ha.data(), n, 1801);
+    for (int64_t i = 0; i < n_tokens * 4; i++) hp[i] = (int32_t) (i % 17);
+
+    mrope_reference_f32(GGML_ROPE_TYPE_IMROPE, n_dims, sections, freq_base,
+                        head_dim, n_heads, n_tokens, hp, ha.data(), expected.data());
+
+    ggml_backend_tensor_set(a,   ha.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(pos, hp.data(), 0, n_tokens * 4 * sizeof(int32_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ROPE_IMROPE: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 2e-3f, 2e-3f)) {
+            if (bad < 5) fprintf(stderr, "ROPE_IMROPE: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ROPE_IMROPE: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("ROPE_IMROPE: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
+// MVP-5b/4: VISION smoke. Vision tower variant — n_dims = head_dim/2 and
+// the rotation pair offset is n_dims (full head), per the ggml header.
+static int test_rope_vision(ggml_backend_t gcu) {
+    const int64_t head_dim = 64, n_heads = 4, n_tokens = 8;
+    const int     n_dims = (int) head_dim / 2;     // VISION constraint
+    // sections sum to n_dims/2 = 16
+    int sections[GGML_MROPE_SECTIONS] = { 8, 8, 0, 0 };
+    const float   freq_base = 10000.0f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, n_tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens * 4);
+    ggml_tensor * c   = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections,
+                                        GGML_ROPE_TYPE_VISION, 0,
+                                        freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ROPE_VISION: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    const size_t n = (size_t) head_dim * n_heads * n_tokens;
+    std::vector<float>   ha(n), hc(n), expected(n);
+    std::vector<int32_t> hp(n_tokens * 4);
+    fill_random_f32(ha.data(), n, 1907);
+    for (int64_t i = 0; i < n_tokens * 4; i++) hp[i] = (int32_t) (i % 17);
+
+    mrope_reference_f32(GGML_ROPE_TYPE_VISION, n_dims, sections, freq_base,
+                        head_dim, n_heads, n_tokens, hp, ha.data(), expected.data());
+
+    ggml_backend_tensor_set(a,   ha.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(pos, hp.data(), 0, n_tokens * 4 * sizeof(int32_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ROPE_VISION: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 2e-3f, 2e-3f)) {
+            if (bad < 5) fprintf(stderr, "ROPE_VISION: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ROPE_VISION: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("ROPE_VISION: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+#endif  // MVP-5b/3-4: deferred multi-axis ROPE smokes
+
 // MVP-5a/5: full BF16 MUL_MAT path (BF16 weight × BF16 input → F32 output).
 // Mirrors test_mul_mat_mixed_f16in: same K/M/N (1024/2048/1024), F32
 // reference accumulator over BF16-rounded values.
