@@ -3316,6 +3316,17 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
         }
         // GGML_OP_COUNT_EQUAL: I32 inputs, I64 scalar output. Rare op
         // (training paths only); not implemented — falls back to CPU.
+        //
+        // Tranche G — window/relative attention ops (SAM-style only):
+        //   GGML_OP_WIN_PART     — custom windowing memory rearrange
+        //   GGML_OP_WIN_UNPART   — inverse of WIN_PART
+        //   GGML_OP_GET_REL_POS  — F16 gather with non-trivial index pattern
+        //   GGML_OP_ADD_REL_POS  — broadcasting bias add along multiple axes
+        // None of these have a clean topsaten counterpart, and they only
+        // appear in vision/SAM models that aren't a near-term GCU target.
+        // The default `return false` at the bottom of this switch sends
+        // them to CPU, which is correct (their CPU forwards are fast
+        // enough at the small shapes these ops use).
         case GGML_OP_ROPE: {
             // MVP-3c: F32 + F16 supported. F16 builds the cos/sin table in
             // F16 to satisfy the SDK's same-dtype requirement
