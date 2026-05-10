@@ -1357,6 +1357,54 @@ static int test_div(ggml_backend_t gcu) {
     return 0;
 }
 
+// Tranche D3: ADD1. a is any tensor, b is a 1-element scalar tensor;
+// dst = a + b[0].
+static int test_add1(ggml_backend_t gcu) {
+    const int64_t M = 1024, N = 4096;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * c = ggml_add1(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ADD1: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 61);
+    const float scalar = 0.375f;
+    for (size_t i = 0; i < n; i++) expected[i] = ha[i] + scalar;
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(b, &scalar, 0, sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ADD1: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!close_enough(hc[i], expected[i], 1e-5f, 1e-5f)) {
+            if (bad < 5) fprintf(stderr, "ADD1: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ADD1: %d mismatches\n", bad); return 1; }
+    printf("ADD1: ok (%zu elements)\n", n);
+    return 0;
+}
+
 // SCALE: dst = a * scalar. F32 only (the GCU path lives in gcu_op_scale).
 static int test_scale(ggml_backend_t gcu) {
     const int64_t M = 512, N = 2048;
@@ -3596,6 +3644,7 @@ int main() {
     rc |= test_mul_f16(gcu);
     rc |= test_sub(gcu);
     rc |= test_div(gcu);
+    rc |= test_add1(gcu);
     rc |= test_scale(gcu);
     rc |= test_get_rows(gcu);
     rc |= test_set_rows(gcu);

@@ -889,6 +889,54 @@ static bool gcu_op_add(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// Tranche D3: ADD1 (a + scalar). src[1] is a 1-element tensor that we
+// broadcast against src[0] via the standard topsatenAdd binary path —
+// keeps the scalar on device and avoids a host sync.
+static bool gcu_op_add1(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * lhs_t = dst->src[0];
+    ggml_tensor * rhs_t = dst->src[1];
+
+    void * scratch = nullptr;
+    size_t scratch_bytes = 0;
+    void * lhs_data = lhs_t->data;
+    if (gcu_dst_aliases_src0_at_runtime(dst)) {
+        scratch_bytes = ggml_nbytes(lhs_t);
+        scratch       = ctx->pool.alloc(scratch_bytes);
+        TOPS_CHECK(topsMemcpyAsync(scratch, lhs_data, scratch_bytes,
+                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
+        lhs_data = scratch;
+    }
+
+    gcu_tensor_dims dout, dlhs;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    {
+        const size_t bpe = ggml_type_size(lhs_t->type);
+        int rank = ggml_n_dims(lhs_t); if (rank < 1) rank = 1;
+        for (int i = 0; i < rank; i++) {
+            dlhs.dims[i] = lhs_t->ne[rank - 1 - i];
+            dlhs.strs[i] = lhs_t->nb[rank - 1 - i] / (int64_t) bpe;
+        }
+        topsatenSize_t shape (dlhs.dims, rank);
+        topsatenSize_t stride(dlhs.strs, rank);
+        topsatenTensor lhs(shape, stride, ggml_to_topsaten_dtype(lhs_t->type), lhs_data);
+
+        // rhs is a 1-element tensor (ggml_is_scalar). Build a rank-1 size-1
+        // descriptor; topsatenAdd's broadcast handles the rest.
+        const size_t r_bpe = ggml_type_size(rhs_t->type);
+        int64_t r_dims[1] = { 1 };
+        int64_t r_strs[1] = { (int64_t) (rhs_t->nb[0] / r_bpe) };
+        topsatenTensor rhs(topsatenSize_t(r_dims, 1), topsatenSize_t(r_strs, 1),
+                           ggml_to_topsaten_dtype(rhs_t->type), rhs_t->data);
+
+        topsatenScalar_t alpha;
+        alpha.dtype = TOPSATEN_DATA_FP32;
+        alpha.fval  = 1.0;
+        TOPSATEN_CHECK(topsatenAdd(out, lhs, rhs, alpha, ctx->compute_stream));
+    }
+    gcu_release_scratch(ctx, scratch, scratch_bytes);
+    return true;
+}
+
 // Tranche D2: element-wise binary SUB / DIV. Same template as ADD/MUL —
 // honours numpy-style broadcasting and runtime-aliased dst handling.
 static bool gcu_op_sub(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
@@ -2510,6 +2558,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return true;        // metadata-only, nothing to launch
         case GGML_OP_ADD:
             return gcu_op_add(ctx, node);
+        case GGML_OP_ADD1:
+            return gcu_op_add1(ctx, node);
         case GGML_OP_SUB:
             return gcu_op_sub(ctx, node);
         case GGML_OP_MUL:
@@ -2703,6 +2753,29 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
         case GGML_OP_DIV:
             return gcu_all_inputs_supported_dtype(op) &&
                    gcu_numpy_broadcastable(op->src[0], op->src[1]);
+        case GGML_OP_ADD1: {
+            // ggml_add1: dst[...] = a[...] + b[0], b is a scalar tensor.
+            // We pass it as a rank-1 size-1 tensor and let topsatenAdd
+            // broadcast across a's full shape.
+            const ggml_tensor * a = op->src[0];
+            const ggml_tensor * b = op->src[1];
+            if (!a || !b) return false;
+            if (!gcu_dtype_supported(a->type) || !gcu_dtype_supported(b->type)) return false;
+            if (a->type != op->type) return false;
+            if (b->type != a->type) return false;
+            if (!ggml_is_scalar(b)) return false;
+            if (!ggml_is_contiguous(a) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        // GGML_OP_ADD_ID is intentionally left to the CPU fallback. The
+        // op is an indexed per-row bias (dst[i0,i1,i2] = a[...] + b[i0,
+        // ids[i1,i2]]) whose only real use site is MoE expert biases in
+        // GGUFs that ship them. Implementing it on GCU requires either a
+        // gather-then-add pair (topsatenIndexSelect + topsatenAdd) with a
+        // shape gymnastic, or a per-row launch loop. The Gemma 4 26B A4B
+        // canary doesn't ship per-expert biases, so the CPU fallback
+        // costs nothing on the model we run end-to-end. Revisit when a
+        // model with these biases lands in the test suite.
         case GGML_OP_SCALE: {
             float params[2];
             memcpy(params, op->op_params, sizeof(params));
