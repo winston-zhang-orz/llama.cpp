@@ -3423,6 +3423,175 @@ static int test_rope_f16(ggml_backend_t gcu) {
     return 0;
 }
 
+// ============================================================================
+// MVP-5a: BF16 dtype smoke tests.
+//
+// Same pattern as the F16 tests above: round F32 inputs to BF16, push to the
+// device, run the op, fetch the BF16 result, compare to a CPU reference
+// computed in F32 from the BF16-rounded inputs (so the comparison only
+// catches on-device BF16-accumulator drift, not the unavoidable rounding
+// of the inputs).
+//
+// BF16 has 8 mantissa bits vs F16's 11. Elementwise tolerance is therefore
+// looser (1e-2 abs / 1e-2 rel) and reduction tolerance looser still
+// (1.5e-2 / 1.5e-2 for RMS_NORM/SOFT_MAX over 1024-wide reductions). Matmul
+// tolerance scales with K and follows the F16 matmul pattern.
+// ============================================================================
+
+static int test_add_bf16(ggml_backend_t gcu) {
+    const int64_t M = 1024, N = 1024;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, M, N);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, M, N);
+    ggml_tensor * c = ggml_add(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ADD_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>      ha_f32(n), hb_f32(n), expected(n);
+    std::vector<ggml_bf16_t> ha(n), hb(n), hc(n);
+    fill_random_f32(ha_f32.data(), n, 1201);
+    fill_random_f32(hb_f32.data(), n, 1202);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), n);
+    ggml_fp32_to_bf16_row(hb_f32.data(), hb.data(), n);
+    for (size_t i = 0; i < n; i++) {
+        expected[i] = ggml_bf16_to_fp32(ha[i]) + ggml_bf16_to_fp32(hb[i]);
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(ggml_bf16_t));
+    ggml_backend_tensor_set(b, hb.data(), 0, n * sizeof(ggml_bf16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ADD_BF16: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(ggml_bf16_t));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float got = ggml_bf16_to_fp32(hc[i]);
+        const float err = std::fabs(got - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(got, expected[i], 1e-2f, 1e-2f)) {
+            if (bad < 5) fprintf(stderr, "ADD_BF16: mismatch idx=%zu got=%f want=%f\n", i, got, expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ADD_BF16: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("ADD_BF16: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
+static int test_mul_bf16(ggml_backend_t gcu) {
+    const int64_t M = 1024, N = 1024;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, M, N);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, M, N);
+    ggml_tensor * c = ggml_mul(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>      ha_f32(n), hb_f32(n), expected(n);
+    std::vector<ggml_bf16_t> ha(n), hb(n), hc(n);
+    fill_random_f32(ha_f32.data(), n, 1211);
+    fill_random_f32(hb_f32.data(), n, 1212);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), n);
+    ggml_fp32_to_bf16_row(hb_f32.data(), hb.data(), n);
+    for (size_t i = 0; i < n; i++) {
+        expected[i] = ggml_bf16_to_fp32(ha[i]) * ggml_bf16_to_fp32(hb[i]);
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(ggml_bf16_t));
+    ggml_backend_tensor_set(b, hb.data(), 0, n * sizeof(ggml_bf16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_BF16: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(ggml_bf16_t));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float got = ggml_bf16_to_fp32(hc[i]);
+        const float err = std::fabs(got - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(got, expected[i], 1e-2f, 1e-2f)) {
+            if (bad < 5) fprintf(stderr, "MUL_BF16: mismatch idx=%zu got=%f want=%f\n", i, got, expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "MUL_BF16: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("MUL_BF16: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
+static int test_scale_bf16(ggml_backend_t gcu) {
+    const int64_t M = 512, N = 1024;
+    const size_t  n = (size_t) M * N;
+    const float   s = 0.125f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, M, N);
+    ggml_tensor * c = ggml_scale(ctx, a, s);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "SCALE_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>      ha_f32(n), expected(n);
+    std::vector<ggml_bf16_t> ha(n), hc(n);
+    fill_random_f32(ha_f32.data(), n, 1221);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), n);
+    for (size_t i = 0; i < n; i++) expected[i] = ggml_bf16_to_fp32(ha[i]) * s;
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(ggml_bf16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "SCALE_BF16: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(ggml_bf16_t));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float got = ggml_bf16_to_fp32(hc[i]);
+        const float err = std::fabs(got - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(got, expected[i], 1e-2f, 1e-2f)) {
+            if (bad < 5) fprintf(stderr, "SCALE_BF16: mismatch idx=%zu got=%f want=%f\n", i, got, expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "SCALE_BF16: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("SCALE_BF16: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
 // MVP-5b: ARGMAX / TOP_K / ARGSORT smoke tests.
 
 // ARGMAX. Input rank-2 [ne0, ne1] F32 → output rank-1 [ne1] I32.
@@ -4355,6 +4524,14 @@ int main() {
     rc |= test_rope(gcu);
     rc |= test_rope_f16(gcu);
     rc |= test_rope_neox(gcu);
+    // MVP-5a: BF16 dtype on core ops. Smoke set runs immediately after the
+    // F16 set so a regression in the BF16 paths surfaces alongside the F16
+    // tests it most closely mirrors. Each BF16 test follows the same
+    // round-trip pattern as its F16 sibling — round F32 inputs to BF16,
+    // run the op, compare the BF16 output against a F32-from-BF16 reference.
+    rc |= test_add_bf16(gcu);
+    rc |= test_mul_bf16(gcu);
+    rc |= test_scale_bf16(gcu);
     rc |= test_mul_mat_mixed(gcu);
     rc |= test_mul_mat_mixed_f16in(gcu);
     rc |= test_mul_mat_id(gcu);

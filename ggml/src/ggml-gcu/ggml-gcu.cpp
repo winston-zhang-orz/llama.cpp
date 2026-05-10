@@ -755,10 +755,11 @@ static const ggml_backend_i ggml_backend_gcu_i = {
 
 static topsatenDataType_t ggml_to_topsaten_dtype(ggml_type t) {
     switch (t) {
-        case GGML_TYPE_F32: return TOPSATEN_DATA_FP32;
-        case GGML_TYPE_F16: return TOPSATEN_DATA_FP16;
-        case GGML_TYPE_I32: return TOPSATEN_DATA_I32;
-        default:            return TOPSATEN_DATA_NONE;
+        case GGML_TYPE_F32:  return TOPSATEN_DATA_FP32;
+        case GGML_TYPE_F16:  return TOPSATEN_DATA_FP16;
+        case GGML_TYPE_BF16: return TOPSATEN_DATA_BF16;
+        case GGML_TYPE_I32:  return TOPSATEN_DATA_I32;
+        default:             return TOPSATEN_DATA_NONE;
     }
 }
 
@@ -815,7 +816,11 @@ static topsatenTensor make_topsaten_tensor(const ggml_tensor * t, gcu_tensor_dim
 // === Op dispatch =====================================================
 
 static bool gcu_dtype_supported(ggml_type t) {
-    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16;
+    // MVP-5a: BF16 added to the device's first-class activation dtypes.
+    // The topsaten SDK exposes TOPSATEN_DATA_BF16 across the elementwise,
+    // norm, softmax, GLU, ROPE, and matmul kernels we already use; per-op
+    // gates above narrow this where a specific kernel is BF16-incompatible.
+    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
 }
 
 static bool gcu_all_inputs_supported_dtype(const ggml_tensor * op) {
@@ -1141,27 +1146,27 @@ static bool gcu_op_rms_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 
     const int64_t hidden_size = src->ne[0];
 
-    // F32 ones buffer for gamma. If src is F16, cast to F16 first into a
-    // per-call scratch (small — at most a few KiB).
+    // F32 ones buffer for gamma. If src is F16/BF16, cast to that dtype
+    // first into a per-call scratch (small — at most a few KiB).
     void * ones_f32 = gcu_get_ones_f32(ctx, hidden_size);
     void * gamma_data = ones_f32;
     size_t cast_bytes = 0;
     void * cast_buf   = nullptr;
     topsatenDataType_t gamma_dtype = TOPSATEN_DATA_FP32;
-    if (src->type == GGML_TYPE_F16) {
+    if (src->type == GGML_TYPE_F16 || src->type == GGML_TYPE_BF16) {
+        topsatenDataType_t target = ggml_to_topsaten_dtype(src->type);
         cast_bytes = (size_t) hidden_size * sizeof(uint16_t);
         cast_buf   = ctx->pool.alloc(cast_bytes);
         int64_t gd[1] = { hidden_size };
         int64_t gs[1] = { 1 };
         topsatenTensor f32_t(topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
                              TOPSATEN_DATA_FP32, ones_f32);
-        topsatenTensor f16_t(topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
-                             TOPSATEN_DATA_FP16, cast_buf);
-        topsatenDataType_t target = TOPSATEN_DATA_FP16;
-        TOPSATEN_CHECK(topsatenTo(f16_t, f32_t, target, false, true,
+        topsatenTensor lo_t (topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
+                             target, cast_buf);
+        TOPSATEN_CHECK(topsatenTo(lo_t, f32_t, target, false, true,
                                   TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
         gamma_data  = cast_buf;
-        gamma_dtype = TOPSATEN_DATA_FP16;
+        gamma_dtype = target;
     }
 
     int64_t gamma_d[1] = { hidden_size };
@@ -1226,33 +1231,35 @@ static bool gcu_op_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 
     const int64_t hidden_size = src->ne[0];
 
-    // F32 ones for the unit affine weight. Cast to F16 if input dtype is F16.
+    // F32 ones for the unit affine weight. Cast to F16/BF16 if input
+    // dtype is one of those (same template as gcu_op_rms_norm).
     void * ones_f32   = gcu_get_ones_f32(ctx, hidden_size);
     void * weight_data = ones_f32;
     size_t cast_bytes  = 0;
     void * cast_buf    = nullptr;
     topsatenDataType_t affine_dtype = TOPSATEN_DATA_FP32;
-    if (src->type == GGML_TYPE_F16) {
+    if (src->type == GGML_TYPE_F16 || src->type == GGML_TYPE_BF16) {
+        topsatenDataType_t target = ggml_to_topsaten_dtype(src->type);
         cast_bytes = (size_t) hidden_size * sizeof(uint16_t);
         cast_buf   = ctx->pool.alloc(cast_bytes);
         int64_t gd[1] = { hidden_size };
         int64_t gs[1] = { 1 };
         topsatenTensor f32_t(topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
                              TOPSATEN_DATA_FP32, ones_f32);
-        topsatenTensor f16_t(topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
-                             TOPSATEN_DATA_FP16, cast_buf);
-        topsatenDataType_t target = TOPSATEN_DATA_FP16;
-        TOPSATEN_CHECK(topsatenTo(f16_t, f32_t, target, false, true,
+        topsatenTensor lo_t (topsatenSize_t(gd, 1), topsatenSize_t(gs, 1),
+                             target, cast_buf);
+        TOPSATEN_CHECK(topsatenTo(lo_t, f32_t, target, false, true,
                                   TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
         weight_data  = cast_buf;
-        affine_dtype = TOPSATEN_DATA_FP16;
+        affine_dtype = target;
     }
 
     // Bias = zeros, sized in bytes for the chosen dtype. The shared
     // zero_bias buffer is zero-filled and oversized; we just need the
     // first hidden_size elements interpreted in our dtype.
+    const bool   src_is_low = (src->type == GGML_TYPE_F16 || src->type == GGML_TYPE_BF16);
     const size_t bias_bytes = (size_t) hidden_size *
-        ((src->type == GGML_TYPE_F16) ? sizeof(uint16_t) : sizeof(float));
+        (src_is_low ? sizeof(uint16_t) : sizeof(float));
     void * bias_data = gcu_get_zero_bias(ctx, bias_bytes);
 
     int64_t affine_d[1] = { hidden_size };
