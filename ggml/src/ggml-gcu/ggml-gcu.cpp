@@ -1363,6 +1363,32 @@ static bool gcu_op_group_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst)
     return true;
 }
 
+// Tranche H: REPEAT. dst is `repeats[i] = ne_dst[i] / ne_src[i]` times the
+// src along dim i. All ne_dst[i] must be integer multiples of ne_src[i]
+// (ggml_can_repeat) — the supports_op gate enforces that. Maps directly
+// onto topsatenRepeat. F32 + F16 supported.
+//
+// Note: this is *not* the same as ggml_repeat_4d's KV-head broadcast,
+// which always materializes through MUL_MAT's broadcast path.
+static bool gcu_op_repeat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+
+    gcu_tensor_dims din, dout;
+    topsatenTensor in_t  = make_topsaten_tensor(src, din);
+    topsatenTensor out_t = make_topsaten_tensor(dst, dout);
+
+    int rank = ggml_n_dims(dst); if (rank < 1) rank = 1;
+    int64_t repeats[GGML_MAX_DIMS];
+    // PyTorch order (slowest-first): repeats[i] = ne_dst[rank-1-i] / ne_src[rank-1-i].
+    for (int i = 0; i < rank; i++) {
+        const int64_t ggml_dim = rank - 1 - i;
+        repeats[i] = dst->ne[ggml_dim] / src->ne[ggml_dim];
+    }
+    topsatenSize_t reps(repeats, rank);
+    TOPSATEN_CHECK(topsatenRepeat(out_t, in_t, reps, ctx->compute_stream));
+    return true;
+}
+
 // Tranche F: LEAKY_RELU. y = x >= 0 ? x : negative_slope * x.
 // Note: ggml represents this as the top-level GGML_OP_LEAKY_RELU (not as a
 // GGML_UNARY_OP_*), with the negative_slope packed in op_params[0].
@@ -2826,6 +2852,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_group_norm(ctx, node);
         case GGML_OP_LEAKY_RELU:
             return gcu_op_leaky_relu(ctx, node);
+        case GGML_OP_REPEAT:
+            return gcu_op_repeat(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -3314,9 +3342,30 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
             return true;
         }
+        case GGML_OP_REPEAT: {
+            // F32 + F16. Each ne_dst[i] must be a positive integer multiple
+            // of ne_src[i] (ggml_can_repeat).
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (!gcu_dtype_supported(src->type)) return false;
+            if (src->type != op->type) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                if (src->ne[i] == 0) return false;
+                if (op->ne[i] % src->ne[i] != 0) return false;
+            }
+            return true;
+        }
         // GGML_OP_COUNT_EQUAL: I32 inputs, I64 scalar output. Rare op
         // (training paths only); not implemented — falls back to CPU.
         //
+        // Tranche H — old / training-path ops left on CPU:
+        //   GGML_OP_DIAG_MASK_INF / GGML_OP_DIAG_MASK_ZERO — older causal-mask
+        //     paths superseded by SOFT_MAX(mask=...) in modern transformers.
+        //     Could be implemented via topsatenTriu + topsatenWhere, but the
+        //     models we target don't emit them.
+        //   GGML_OP_DIAG — vector → diagonal matrix; only used by training paths.
+        //   GGML_OP_OUT_PROD — outer product; training-only path.
         // Tranche G — window/relative attention ops (SAM-style only):
         //   GGML_OP_WIN_PART     — custom windowing memory rearrange
         //   GGML_OP_WIN_UNPART   — inverse of WIN_PART

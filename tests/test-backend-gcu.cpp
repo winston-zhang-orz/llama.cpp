@@ -1116,6 +1116,73 @@ static int test_leaky_relu(ggml_backend_t gcu) {
     return 0;
 }
 
+// Tranche H: REPEAT. F32 path. Replicates a small src into a larger dst by
+// integer factors along each dim. Reference computed bit-exactly (it's a
+// gather/copy).
+static int test_repeat(ggml_backend_t gcu) {
+    const int64_t s0 = 8,  s1 = 4,  s2 = 2,  s3 = 1;
+    const int64_t r0 = 3,  r1 = 2,  r2 = 4,  r3 = 1;
+    const int64_t d0 = s0 * r0, d1 = s1 * r1, d2 = s2 * r2, d3 = s3 * r3;
+    const size_t  ns = (size_t) s0 * s1 * s2 * s3;
+    const size_t  nd = (size_t) d0 * d1 * d2 * d3;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, s0, s1, s2, s3);
+    ggml_tensor * c = ggml_repeat_4d(ctx, a, d0, d1, d2, d3);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "REPEAT: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(ns), hc(nd), expected(nd);
+    fill_random_f32(ha.data(), ns, 481);
+
+    // CPU-style reference: dst[i3,i2,i1,i0] = src[i3 % s3, i2 % s2, i1 % s1, i0 % s0]
+    for (int64_t i3 = 0; i3 < d3; i3++) {
+        for (int64_t i2 = 0; i2 < d2; i2++) {
+            for (int64_t i1 = 0; i1 < d1; i1++) {
+                for (int64_t i0 = 0; i0 < d0; i0++) {
+                    const int64_t k0 = i0 % s0, k1 = i1 % s1;
+                    const int64_t k2 = i2 % s2, k3 = i3 % s3;
+                    expected[((i3*d2 + i2)*d1 + i1)*d0 + i0] =
+                        ha[((k3*s2 + k2)*s1 + k1)*s0 + k0];
+                }
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ns * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "REPEAT: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, nd * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < nd; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 0.0f, 0.0f)) {
+            if (bad < 5) fprintf(stderr, "REPEAT: mismatch idx=%zu got=%f want=%f\n",
+                                 i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "REPEAT: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("REPEAT: ok (%zu elements, max_abs_err=%f)\n", nd, max_err);
+    return 0;
+}
+
 // MUL_MAT_MIXED variant with F16 input (instead of F32): F16w × F16x -> F32.
 // Fills the third dtype combo in the F16-weight family of MUL_MAT:
 //   F32w × F32x → F32   (test_mul_mat)
@@ -4245,6 +4312,7 @@ int main() {
     rc |= test_l2_norm(gcu);
     rc |= test_group_norm(gcu);
     rc |= test_leaky_relu(gcu);
+    rc |= test_repeat(gcu);
     rc |= test_async_overlap(gcu);
 
     const bool bench_ran = (rc == 0 && getenv("GCU_BENCH") != nullptr);
