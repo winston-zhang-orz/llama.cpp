@@ -4023,6 +4023,379 @@ static int test_rope_bf16(ggml_backend_t gcu) {
     return 0;
 }
 
+// MVP-5a/5: full BF16 MUL_MAT path (BF16 weight × BF16 input → F32 output).
+// Mirrors test_mul_mat_mixed_f16in: same K/M/N (1024/2048/1024), F32
+// reference accumulator over BF16-rounded values.
+static int test_mul_mat_bf16(ggml_backend_t gcu) {
+    const int64_t K = 1024, M = 2048, N = 1024;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, K, M);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, K, N);
+    ggml_tensor * c = ggml_mul_mat(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL_MAT_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       ha_f32((size_t) K * M);
+    std::vector<float>       hb_f32((size_t) K * N);
+    std::vector<ggml_bf16_t> ha((size_t) K * M);
+    std::vector<ggml_bf16_t> hb((size_t) K * N);
+    std::vector<float>       hc((size_t) M * N), expected((size_t) M * N);
+    fill_random_f32(ha_f32.data(), ha_f32.size(), 1371);
+    fill_random_f32(hb_f32.data(), hb_f32.size(), 1372);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), ha_f32.size());
+    ggml_fp32_to_bf16_row(hb_f32.data(), hb.data(), hb_f32.size());
+
+    for (int64_t nn = 0; nn < N; nn++) {
+        for (int64_t mm = 0; mm < M; mm++) {
+            float acc = 0.0f;
+            const ggml_bf16_t * apf = ha.data() + mm * K;
+            const ggml_bf16_t * bpf = hb.data() + nn * K;
+            for (int64_t k = 0; k < K; k++) {
+                acc += ggml_bf16_to_fp32(apf[k]) * ggml_bf16_to_fp32(bpf[k]);
+            }
+            expected[mm + nn * M] = acc;
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(ggml_bf16_t));
+    ggml_backend_tensor_set(b, hb.data(), 0, hb.size() * sizeof(ggml_bf16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_MAT_BF16: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < hc.size(); i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        // K=1024 BF16 reduction: ~5x larger drift vs the F16 mixed path.
+        if (!close_enough(hc[i], expected[i], 5e-1f, 5e-2f)) {
+            if (bad < 5) fprintf(stderr, "MUL_MAT_BF16: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 i, hc[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MUL_MAT_BF16: %d mismatches over %zu (max_abs_err=%f)\n",
+                bad, hc.size(), max_err);
+        return 1;
+    }
+    printf("MUL_MAT_BF16: ok (%zu elements, max_abs_err=%f)\n", hc.size(), max_err);
+    return 0;
+}
+
+// BF16 weight × F32 input → F32 output. Real-model shape (K=4096, M=4096, N=1)
+// hits a decode-style matmul width that smoke at K=256 misses. The supports_op
+// gate routes this; the handler casts F32 input to BF16 once.
+static int test_mul_mat_mixed_bf16w(ggml_backend_t gcu) {
+    const int64_t K = 4096, M = 4096, N = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, K, M);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  K, N);
+    ggml_tensor * c = ggml_mul_mat(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL_MAT_BF16w: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       ha_f32((size_t) K * M);
+    std::vector<ggml_bf16_t> ha((size_t) K * M);
+    std::vector<float>       hb((size_t) K * N);
+    std::vector<float>       hc((size_t) M * N), expected((size_t) M * N);
+    fill_random_f32(ha_f32.data(), ha_f32.size(), 1381);
+    fill_random_f32(hb.data(),     hb.size(),     1382);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), ha_f32.size());
+
+    // Reference: BF16-rounded weight × F32 input (then BF16-rounded by handler).
+    // Exact handler input cast: F32 -> BF16, so pre-round hb to BF16 too.
+    std::vector<ggml_bf16_t> hb_bf16((size_t) K * N);
+    ggml_fp32_to_bf16_row(hb.data(), hb_bf16.data(), hb.size());
+    for (int64_t nn = 0; nn < N; nn++) {
+        for (int64_t mm = 0; mm < M; mm++) {
+            float acc = 0.0f;
+            const ggml_bf16_t * apf = ha.data()    + mm * K;
+            const ggml_bf16_t * bpf = hb_bf16.data() + nn * K;
+            for (int64_t k = 0; k < K; k++) {
+                acc += ggml_bf16_to_fp32(apf[k]) * ggml_bf16_to_fp32(bpf[k]);
+            }
+            expected[mm + nn * M] = acc;
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(ggml_bf16_t));
+    ggml_backend_tensor_set(b, hb.data(), 0, hb.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_MAT_BF16w: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < hc.size(); i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        // K=4096 BF16 accumulator: per-element drift up to ~2.5%. Loose.
+        if (!close_enough(hc[i], expected[i], 1.0f, 5e-2f)) {
+            if (bad < 5) fprintf(stderr, "MUL_MAT_BF16w: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 i, hc[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MUL_MAT_BF16w: %d mismatches over %zu (max_abs_err=%f)\n",
+                bad, hc.size(), max_err);
+        return 1;
+    }
+    printf("MUL_MAT_BF16w: ok (%zu elements, max_abs_err=%f)\n", hc.size(), max_err);
+    return 0;
+}
+
+// MUL_MAT_ID with BF16 weights. F32 input + F32 output, mirrors
+// test_mul_mat_id_f16 shape (K=256, M=512, n_expert=4, n_used=2, n_tokens=8).
+static int test_mul_mat_id_bf16(ggml_backend_t gcu) {
+    const int64_t K = 256;
+    const int64_t M = 512;
+    const int64_t n_expert      = 4;
+    const int64_t n_expert_used = 2;
+    const int64_t n_tokens      = 8;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * as_w = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, K, M, n_expert);
+    ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,  K, n_expert_used, n_tokens);
+    ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+    ggml_tensor * c    = ggml_mul_mat_id(ctx, as_w, b, ids);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL_MAT_ID_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       w_f32((size_t) K * M * n_expert);
+    std::vector<ggml_bf16_t> w_bf16((size_t) K * M * n_expert);
+    std::vector<float>       h_b ((size_t) K * n_expert_used * n_tokens);
+    std::vector<int32_t>     h_ids((size_t) n_expert_used * n_tokens);
+    std::vector<float>       h_c ((size_t) M * n_expert_used * n_tokens);
+    std::vector<float>       expected((size_t) M * n_expert_used * n_tokens);
+
+    fill_random_f32(w_f32.data(), w_f32.size(), 1391);
+    fill_random_f32(h_b.data(),   h_b.size(),   1392);
+    ggml_fp32_to_bf16_row(w_f32.data(), w_bf16.data(), w_bf16.size());
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            h_ids[t * n_expert_used + e] = (int32_t) ((t + e * 2) % n_expert);
+        }
+    }
+
+    // Reference: dequant BF16 weight to F32, pre-round F32 input to BF16
+    // (matches the handler's input-cast path), then F32-accumulate.
+    std::vector<float>       w_lossy((size_t) K * M * n_expert);
+    for (size_t i = 0; i < w_bf16.size(); i++) w_lossy[i] = ggml_bf16_to_fp32(w_bf16[i]);
+    std::vector<ggml_bf16_t> b_bf16(h_b.size());
+    ggml_fp32_to_bf16_row(h_b.data(), b_bf16.data(), h_b.size());
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            const int32_t expert_id = h_ids[t * n_expert_used + e];
+            const float * w_mat = w_lossy.data() + (size_t) expert_id * M * K;
+            const ggml_bf16_t * b_vec = b_bf16.data() + (size_t)(t * n_expert_used + e) * K;
+            float       * c_vec = expected.data() + (size_t)(t * n_expert_used + e) * M;
+            for (int64_t m = 0; m < M; m++) {
+                float acc = 0.0f;
+                const float * w_row = w_mat + m * K;
+                for (int64_t k = 0; k < K; k++) acc += w_row[k] * ggml_bf16_to_fp32(b_vec[k]);
+                c_vec[m] = acc;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(as_w, w_bf16.data(), 0, w_bf16.size() * sizeof(ggml_bf16_t));
+    ggml_backend_tensor_set(b,    h_b.data(),    0, h_b.size()    * sizeof(float));
+    ggml_backend_tensor_set(ids,  h_ids.data(),  0, h_ids.size()  * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_MAT_ID_BF16: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, h_c.data(), 0, h_c.size() * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < h_c.size(); i++) {
+        const float err = std::fabs(h_c[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(h_c[i], expected[i], 5e-1f, 5e-2f)) {
+            if (bad < 5) fprintf(stderr, "MUL_MAT_ID_BF16: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 i, h_c[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MUL_MAT_ID_BF16: %d mismatches over %zu (max_abs_err=%f)\n",
+                bad, h_c.size(), max_err);
+        return 1;
+    }
+    printf("MUL_MAT_ID_BF16: ok (%zu elements, max_abs_err=%f)\n", h_c.size(), max_err);
+    return 0;
+}
+
+// GLU split form with GEGLU on BF16 inputs. Mirrors test_glu_split with
+// looser tolerance. The handler is dtype-agnostic (uses make_topsaten_tensor)
+// so this exercises the supports_op gate + topsatenGelu/topsatenMul on BF16.
+static int test_geglu_split_bf16(ggml_backend_t gcu) {
+    const int64_t n_ff = 256, n_tokens = 32;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 2 * n_ff, n_tokens);
+    ggml_tensor * c = ggml_glu(ctx, a, GGML_GLU_OP_GEGLU, /*swapped=*/false);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "GEGLU_SPLIT_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    const size_t na = (size_t)(2 * n_ff) * (size_t) n_tokens;
+    const size_t nc = (size_t) n_ff * (size_t) n_tokens;
+    std::vector<float>       ha_f32(na);
+    std::vector<ggml_bf16_t> ha(na), hc(nc);
+    std::vector<float>       expected(nc);
+    fill_random_f32(ha_f32.data(), na, 1401);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), na);
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        const ggml_bf16_t * row = ha.data() + (size_t) t * (2 * n_ff);
+        for (int64_t i = 0; i < n_ff; i++) {
+            const float gate = ggml_bf16_to_fp32(row[i]);
+            const float up   = ggml_bf16_to_fp32(row[n_ff + i]);
+            const float act  = 0.5f * gate * (1.0f + std::erf(gate / std::sqrt(2.0f)));
+            expected[(size_t) t * n_ff + i] = act * up;
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, na * sizeof(ggml_bf16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "GEGLU_SPLIT_BF16: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, nc * sizeof(ggml_bf16_t));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < nc; i++) {
+        const float got = ggml_bf16_to_fp32(hc[i]);
+        const float err = std::fabs(got - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(got, expected[i], 2e-2f, 2e-2f)) {
+            if (bad < 5) fprintf(stderr, "GEGLU_SPLIT_BF16: mismatch idx=%zu got=%f want=%f\n",
+                                 i, got, expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "GEGLU_SPLIT_BF16: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("GEGLU_SPLIT_BF16: ok (%zu elements, max_abs_err=%f)\n", nc, max_err);
+    return 0;
+}
+
+// CPY conversions: F32 ↔ BF16 and F16 ↔ BF16. Each direction goes through
+// gcu_op_cpy's topsatenTo. Reference rounds the source value through the
+// equivalent host-side helper to validate the device-side round-trip.
+static int test_cpy_bf16(ggml_backend_t gcu) {
+    const int64_t n = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    // Two ggml_cpy nodes: F32 -> BF16, then BF16 -> F32.
+    ggml_tensor * a32  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,  n);
+    ggml_tensor * abf16 = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, n);
+    ggml_tensor * a32b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,  n);
+    ggml_tensor * cpy1 = ggml_cpy(ctx, a32,  abf16);
+    ggml_tensor * cpy2 = ggml_cpy(ctx, cpy1, a32b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "CPY_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       ha((size_t) n), hc((size_t) n);
+    std::vector<ggml_bf16_t> hb((size_t) n);
+    fill_random_f32(ha.data(), n, 1411);
+
+    // Reference: F32 -> BF16 (lossy) -> F32 (lossless reconstruct of the BF16 value).
+    std::vector<ggml_bf16_t> expected_bf16((size_t) n);
+    ggml_fp32_to_bf16_row(ha.data(), expected_bf16.data(), n);
+    std::vector<float> expected((size_t) n);
+    for (int64_t i = 0; i < n; i++) expected[i] = ggml_bf16_to_fp32(expected_bf16[i]);
+
+    ggml_backend_tensor_set(a32, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, cpy2);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "CPY_BF16: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(a32b, hc.data(),  0, n * sizeof(float));
+    ggml_backend_tensor_get(abf16, hb.data(), 0, n * sizeof(ggml_bf16_t));
+
+    int bad = 0;
+    for (int64_t i = 0; i < n; i++) {
+        // F32 <-> BF16 round-trip is bit-exact for the BF16-representable value.
+        if (hc[i] != expected[i]) {
+            if (bad < 5) fprintf(stderr, "CPY_BF16: i=%lld got=%f want=%f\n",
+                                 (long long) i, hc[i], expected[i]);
+            bad++;
+        }
+        // The intermediate BF16 must match the host conversion exactly.
+        if (hb[i].bits != expected_bf16[i].bits) {
+            if (bad < 5) fprintf(stderr, "CPY_BF16: bf16 mismatch i=%lld\n", (long long) i);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "CPY_BF16: %d mismatches\n", bad); return 1; }
+    printf("CPY_BF16: ok (%lld F32<->BF16 round-trips)\n", (long long) n);
+    return 0;
+}
+
 // MVP-5b: ARGMAX / TOP_K / ARGSORT smoke tests.
 
 // ARGMAX. Input rank-2 [ne0, ne1] F32 → output rank-1 [ne1] I32.
@@ -4970,6 +5343,11 @@ int main() {
     rc |= test_norm_bf16(gcu);
     rc |= test_softmax_bf16(gcu);
     rc |= test_rope_bf16(gcu);
+    rc |= test_mul_mat_bf16(gcu);
+    rc |= test_mul_mat_mixed_bf16w(gcu);
+    rc |= test_mul_mat_id_bf16(gcu);
+    rc |= test_geglu_split_bf16(gcu);
+    rc |= test_cpy_bf16(gcu);
     rc |= test_mul_mat_mixed(gcu);
     rc |= test_mul_mat_mixed_f16in(gcu);
     rc |= test_mul_mat_id(gcu);

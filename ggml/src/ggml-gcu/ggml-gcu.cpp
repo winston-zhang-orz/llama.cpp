@@ -1482,10 +1482,12 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         return true;
     }
 
-    // F16-weight path: cast input to F16 if needed, run F16 Linear, cast
-    // output back to dst dtype. Q-typed weights take this path with their
-    // device bytes interpreted as F16 (wt_eff == F16).
-    GGML_ASSERT(wt_eff == GGML_TYPE_F16);
+    // Low-precision weight path: works for both F16 and BF16 weights, as
+    // well as Q-typed weights (whose device bytes are F16 after MVP-3a's
+    // dequant-on-load). The kernel runs in the weight's effective dtype
+    // and we cast input/output to/from F32 as needed.
+    GGML_ASSERT(wt_eff == GGML_TYPE_F16 || wt_eff == GGML_TYPE_BF16);
+    const topsatenDataType_t lp_dtype = ggml_to_topsaten_dtype(wt_eff);
     const int64_t M = dst->ne[0];
     const int64_t K = w->ne[0];
     const int64_t N = x->ne[1];
@@ -1501,20 +1503,36 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         int64_t xs[2] = { K, 1 };
         topsatenTensor x_f32(topsatenSize_t(xd, 2), topsatenSize_t(xs, 2),
                              TOPSATEN_DATA_FP32, x->data);
-        topsatenTensor x_f16(topsatenSize_t(xd, 2), topsatenSize_t(xs, 2),
-                             TOPSATEN_DATA_FP16, x_cast);
-        topsatenDataType_t target = TOPSATEN_DATA_FP16;
-        TOPSATEN_CHECK(topsatenTo(x_f16, x_f32, target, false, true,
+        topsatenTensor x_lp (topsatenSize_t(xd, 2), topsatenSize_t(xs, 2),
+                             lp_dtype, x_cast);
+        topsatenDataType_t target = lp_dtype;
+        TOPSATEN_CHECK(topsatenTo(x_lp, x_f32, target, false, true,
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
+        x_data = x_cast;
+    } else if (xt != wt_eff) {
+        // F16 input but BF16 weight (or vice-versa). topsatenLinear requires
+        // matching lhs/rhs dtypes; cast input to the weight's dtype.
+        x_cast_bytes = (size_t) N * K * sizeof(uint16_t);
+        x_cast       = ctx->pool.alloc(x_cast_bytes);
+
+        int64_t xd[2] = { N, K };
+        int64_t xs[2] = { K, 1 };
+        topsatenTensor x_in (topsatenSize_t(xd, 2), topsatenSize_t(xs, 2),
+                             ggml_to_topsaten_dtype(xt), x->data);
+        topsatenTensor x_lp (topsatenSize_t(xd, 2), topsatenSize_t(xs, 2),
+                             lp_dtype, x_cast);
+        topsatenDataType_t target = lp_dtype;
+        TOPSATEN_CHECK(topsatenTo(x_lp, x_in, target, false, true,
                                   TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
         x_data = x_cast;
     }
 
-    // F16 output scratch.
-    const size_t y_f16_bytes = (size_t) N * M * sizeof(uint16_t);
-    void * y_f16 = ctx->pool.alloc(y_f16_bytes);
+    // Low-prec output scratch (same byte size as F16: 2 bytes/element).
+    const size_t y_lp_bytes = (size_t) N * M * sizeof(uint16_t);
+    void * y_lp = ctx->pool.alloc(y_lp_bytes);
 
-    // F16 zero bias. Reuse zero_bias buffer (it's zero-filled and sized in
-    // bytes, so the F16-interpretation of the leading bytes is also zero).
+    // Low-prec zero bias. Reuse zero_bias buffer — zero-filled and sized
+    // in bytes; the BF16/F16 interpretation of zero-bytes is still zero.
     const size_t bias_bytes = (size_t) M * sizeof(uint16_t);
     void * bias_dev = gcu_get_zero_bias(ctx, bias_bytes);
 
@@ -1529,32 +1547,32 @@ static bool gcu_op_mul_mat(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         build_2d_q_as_f16(w, rhs_d, rhs_s);
     }
 
-    topsatenTensor lhs_f16(topsatenSize_t(lhs_d, 2), topsatenSize_t(lhs_s, 2),
-                           TOPSATEN_DATA_FP16, x_data);
-    topsatenTensor rhs_f16(topsatenSize_t(rhs_d, 2), topsatenSize_t(rhs_s, 2),
-                           TOPSATEN_DATA_FP16, w->data);
-    topsatenTensor out_f16(topsatenSize_t(out_d, 2), topsatenSize_t(out_s, 2),
-                           TOPSATEN_DATA_FP16, y_f16);
-    topsatenTensor bias_f16(topsatenSize_t(bias_d, 1), topsatenSize_t(bias_s, 1),
-                            TOPSATEN_DATA_FP16, bias_dev);
+    topsatenTensor lhs_lp(topsatenSize_t(lhs_d, 2), topsatenSize_t(lhs_s, 2),
+                          lp_dtype, x_data);
+    topsatenTensor rhs_lp(topsatenSize_t(rhs_d, 2), topsatenSize_t(rhs_s, 2),
+                          lp_dtype, w->data);
+    topsatenTensor out_lp(topsatenSize_t(out_d, 2), topsatenSize_t(out_s, 2),
+                          lp_dtype, y_lp);
+    topsatenTensor bias_lp(topsatenSize_t(bias_d, 1), topsatenSize_t(bias_s, 1),
+                           lp_dtype, bias_dev);
 
-    TOPSATEN_CHECK(topsatenLinear(out_f16, lhs_f16, rhs_f16, bias_f16, ctx->compute_stream));
+    TOPSATEN_CHECK(topsatenLinear(out_lp, lhs_lp, rhs_lp, bias_lp, ctx->compute_stream));
 
-    // Cast output F16 -> dst dtype if needed.
-    if (ot == GGML_TYPE_F32) {
+    // Cast output low-prec -> dst dtype if needed.
+    if (ot != wt_eff) {
         int64_t od[2] = { N, M }, os[2] = { M, 1 };
-        topsatenTensor out_f32(topsatenSize_t(od, 2), topsatenSize_t(os, 2),
-                               TOPSATEN_DATA_FP32, dst->data);
-        topsatenDataType_t target = TOPSATEN_DATA_FP32;
-        TOPSATEN_CHECK(topsatenTo(out_f32, out_f16, target, false, true,
+        topsatenTensor out_dst(topsatenSize_t(od, 2), topsatenSize_t(os, 2),
+                               ggml_to_topsaten_dtype(ot), dst->data);
+        topsatenDataType_t target = ggml_to_topsaten_dtype(ot);
+        TOPSATEN_CHECK(topsatenTo(out_dst, out_lp, target, false, true,
                                   TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
     } else {
-        TOPS_CHECK(topsMemcpyAsync(dst->data, y_f16, y_f16_bytes,
+        TOPS_CHECK(topsMemcpyAsync(dst->data, y_lp, y_lp_bytes,
                                    topsMemcpyDeviceToDevice, ctx->compute_stream));
     }
 
     gcu_release_scratch(ctx, x_cast, x_cast_bytes);
-    gcu_release_scratch(ctx, y_f16, y_f16_bytes);
+    gcu_release_scratch(ctx, y_lp,   y_lp_bytes);
     return true;
 }
 
@@ -1603,10 +1621,18 @@ static bool gcu_op_mul_mat_id(ggml_backend_gcu_context * ctx, ggml_tensor * dst)
 
     const ggml_type wt = w->type;
     const ggml_type xt = x->type;
-    const bool      wq    = gcu_q_supported(wt);
-    const bool      w_f16 = wq || wt == GGML_TYPE_F16;
-    GGML_ASSERT(w_f16 || wt == GGML_TYPE_F32);
-    GGML_ASSERT(xt == GGML_TYPE_F32 || xt == GGML_TYPE_F16);
+    const bool      wq   = gcu_q_supported(wt);
+    // MVP-5a: w_lp covers F16, BF16, and Q-typed weights (Q stored as F16
+    // on device after MVP-3a's dequant-on-load). The kernel runs in the
+    // weight's effective low-prec dtype and we cast input to match once
+    // per call sweep.
+    const ggml_type wt_eff = wq ? GGML_TYPE_F16 : wt;
+    const bool      w_lp = wq || wt == GGML_TYPE_F16 || wt == GGML_TYPE_BF16;
+    GGML_ASSERT(w_lp || wt == GGML_TYPE_F32);
+    GGML_ASSERT(xt == GGML_TYPE_F32 || xt == GGML_TYPE_F16 || xt == GGML_TYPE_BF16);
+    const topsatenDataType_t lp_dtype = w_lp
+        ? ggml_to_topsaten_dtype(wt_eff)
+        : TOPSATEN_DATA_FP32;
 
     // Drain compute_stream so the i32 values in ids are fully written
     // (they may have been produced by a preceding op on the same stream),
@@ -1617,39 +1643,41 @@ static bool gcu_op_mul_mat_id(ggml_backend_gcu_context * ctx, ggml_tensor * dst)
                           ids_host.size() * sizeof(int32_t),
                           topsMemcpyDeviceToHost));
 
-    // For the F16-weight path, cast all of x to F16 once up front and
-    // index into the cast buffer in the inner loop. Avoids per-call cast
-    // overhead at the cost of one [cols, r, n_tokens]-sized scratch.
-    void * x_f16_buf  = nullptr;
-    size_t x_f16_bytes = 0;
-    if (w_f16 && xt == GGML_TYPE_F32) {
+    // For the low-prec weight path, cast all of x once up front and index
+    // into the cast buffer in the inner loop. Avoids per-call cast overhead
+    // at the cost of one [cols, r, n_tokens]-sized scratch. Cast happens
+    // when xt != wt_eff (covers F32 input vs F16/BF16 weight, and the
+    // F16-input vs BF16-weight or BF16-input vs F16-weight mixes).
+    void * x_lp_buf   = nullptr;
+    size_t x_lp_bytes = 0;
+    if (w_lp && xt != wt_eff) {
         const int64_t x_total = cols * r * n_tokens;
-        x_f16_bytes = (size_t) x_total * sizeof(uint16_t);
-        x_f16_buf   = ctx->pool.alloc(x_f16_bytes);
+        x_lp_bytes = (size_t) x_total * sizeof(uint16_t);
+        x_lp_buf   = ctx->pool.alloc(x_lp_bytes);
 
         int64_t xd[1] = { x_total };
         int64_t xs[1] = { 1 };
-        topsatenTensor x_f32(topsatenSize_t(xd, 1), topsatenSize_t(xs, 1),
-                             TOPSATEN_DATA_FP32, x->data);
-        topsatenTensor x_f16(topsatenSize_t(xd, 1), topsatenSize_t(xs, 1),
-                             TOPSATEN_DATA_FP16, x_f16_buf);
-        topsatenDataType_t target_f16 = TOPSATEN_DATA_FP16;
-        TOPSATEN_CHECK(topsatenTo(x_f16, x_f32, target_f16, false, true,
+        topsatenTensor x_in(topsatenSize_t(xd, 1), topsatenSize_t(xs, 1),
+                            ggml_to_topsaten_dtype(xt), x->data);
+        topsatenTensor x_lp(topsatenSize_t(xd, 1), topsatenSize_t(xs, 1),
+                            lp_dtype, x_lp_buf);
+        topsatenDataType_t target_lp = lp_dtype;
+        TOPSATEN_CHECK(topsatenTo(x_lp, x_in, target_lp, false, true,
                                   TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
     }
 
-    // Per-call F16 output scratch. Reused across the loop — same-stream
+    // Per-call low-prec output scratch. Reused across the loop — same-stream
     // ordering guarantees the previous call's cast-to-F32 finishes before
     // the next call overwrites the buffer.
-    void * y_f16_buf  = nullptr;
-    size_t y_f16_bytes = 0;
-    if (w_f16) {
-        y_f16_bytes = (size_t) rows * sizeof(uint16_t);
-        y_f16_buf   = ctx->pool.alloc(y_f16_bytes);
+    void * y_lp_buf   = nullptr;
+    size_t y_lp_bytes = 0;
+    if (w_lp) {
+        y_lp_bytes = (size_t) rows * sizeof(uint16_t);
+        y_lp_buf   = ctx->pool.alloc(y_lp_bytes);
     }
 
     // Zero bias sized for one row of the chosen output dtype.
-    const size_t bias_bytes = w_f16
+    const size_t bias_bytes = w_lp
         ? (size_t) rows * sizeof(uint16_t)
         : (size_t) rows * sizeof(float);
     void * bias_dev = gcu_get_zero_bias(ctx, bias_bytes);
@@ -1672,9 +1700,9 @@ static bool gcu_op_mul_mat_id(ggml_backend_gcu_context * ctx, ggml_tensor * dst)
             // Input pointer for this (e, t) slot.
             const int64_t e_b = e % r;
             void * x_ptr;
-            if (w_f16 && xt == GGML_TYPE_F32) {
+            if (w_lp && xt != wt_eff) {
                 const size_t off_elems = (size_t) (t * r + e_b) * (size_t) cols;
-                x_ptr = (char *) x_f16_buf + off_elems * sizeof(uint16_t);
+                x_ptr = (char *) x_lp_buf + off_elems * sizeof(uint16_t);
             } else {
                 x_ptr = (char *) x->data
                       + (size_t) t * x->nb[2]
@@ -1695,9 +1723,9 @@ static bool gcu_op_mul_mat_id(ggml_backend_gcu_context * ctx, ggml_tensor * dst)
             int64_t bias_d[1] = { rows };
             int64_t bias_s[1] = { 1 };
 
-            if (w_f16) {
-                // Q-stored-as-F16 has packed F16 strides; F16 native uses
-                // its declared nb[].
+            if (w_lp) {
+                // Q-stored-as-F16 has packed F16 strides; F16 / BF16 native
+                // use the declared nb[].
                 if (wq) {
                     rhs_s[0] = cols;
                     rhs_s[1] = 1;
@@ -1706,21 +1734,21 @@ static bool gcu_op_mul_mat_id(ggml_backend_gcu_context * ctx, ggml_tensor * dst)
                     rhs_s[1] = 1;
                 }
 
-                topsatenTensor lhs_f16(topsatenSize_t(lhs_d, 2), topsatenSize_t(lhs_s, 2),
-                                       TOPSATEN_DATA_FP16, x_ptr);
-                topsatenTensor rhs_f16(topsatenSize_t(rhs_d, 2), topsatenSize_t(rhs_s, 2),
-                                       TOPSATEN_DATA_FP16, w_ptr);
-                topsatenTensor out_f16(topsatenSize_t(out_d, 2), topsatenSize_t(out_s, 2),
-                                       TOPSATEN_DATA_FP16, y_f16_buf);
-                topsatenTensor bias_f16(topsatenSize_t(bias_d, 1), topsatenSize_t(bias_s, 1),
-                                        TOPSATEN_DATA_FP16, bias_dev);
-                TOPSATEN_CHECK(topsatenLinear(out_f16, lhs_f16, rhs_f16, bias_f16,
+                topsatenTensor lhs_lp(topsatenSize_t(lhs_d, 2), topsatenSize_t(lhs_s, 2),
+                                      lp_dtype, x_ptr);
+                topsatenTensor rhs_lp(topsatenSize_t(rhs_d, 2), topsatenSize_t(rhs_s, 2),
+                                      lp_dtype, w_ptr);
+                topsatenTensor out_lp(topsatenSize_t(out_d, 2), topsatenSize_t(out_s, 2),
+                                      lp_dtype, y_lp_buf);
+                topsatenTensor bias_lp(topsatenSize_t(bias_d, 1), topsatenSize_t(bias_s, 1),
+                                       lp_dtype, bias_dev);
+                TOPSATEN_CHECK(topsatenLinear(out_lp, lhs_lp, rhs_lp, bias_lp,
                                               ctx->compute_stream));
 
                 topsatenTensor out_f32(topsatenSize_t(out_d, 2), topsatenSize_t(out_s, 2),
                                        TOPSATEN_DATA_FP32, dst_ptr);
                 topsatenDataType_t target_f32 = TOPSATEN_DATA_FP32;
-                TOPSATEN_CHECK(topsatenTo(out_f32, out_f16, target_f32,
+                TOPSATEN_CHECK(topsatenTo(out_f32, out_lp, target_f32,
                                           false, true, TOPSATEN_MEMORY_CONTIGUOUS,
                                           ctx->compute_stream));
             } else {
@@ -1740,8 +1768,8 @@ static bool gcu_op_mul_mat_id(ggml_backend_gcu_context * ctx, ggml_tensor * dst)
         }
     }
 
-    gcu_release_scratch(ctx, x_f16_buf, x_f16_bytes);
-    gcu_release_scratch(ctx, y_f16_buf, y_f16_bytes);
+    gcu_release_scratch(ctx, x_lp_buf, x_lp_bytes);
+    gcu_release_scratch(ctx, y_lp_buf, y_lp_bytes);
     return true;
 }
 
@@ -3163,10 +3191,13 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!src) return false;
             if (!gcu_dtype_supported(src->type) || !gcu_dtype_supported(op->type)) return false;
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
-            // Same dtype OR F32↔F16 dtype conversion via topsatenTo.
+            // Same dtype OR any pairwise F32/F16/BF16 conversion via topsatenTo.
             if (src->type != op->type) {
-                bool ok = (src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16) ||
-                          (src->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F32);
+                const ggml_type s = src->type, d = op->type;
+                const bool ok =
+                    (s == GGML_TYPE_F32  && (d == GGML_TYPE_F16 || d == GGML_TYPE_BF16)) ||
+                    (s == GGML_TYPE_F16  && (d == GGML_TYPE_F32 || d == GGML_TYPE_BF16)) ||
+                    (s == GGML_TYPE_BF16 && (d == GGML_TYPE_F32 || d == GGML_TYPE_F16));
                 if (!ok) return false;
             }
             return true;
@@ -3178,11 +3209,17 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             // Supported dtype combos:
             //   (F32, F32, F32)        all-F32 fast path
             //   (F16, F32 or F16, F32 or F16)   F16 weight + cast input/output
+            //   (BF16, F32/F16/BF16, F32/F16/BF16) BF16 weight + cast input/output
             bool ok = false;
             if (w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) ok = true;
             if (w->type == GGML_TYPE_F16 &&
                 (x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32) &&
                 (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32)) ok = true;
+            // MVP-5a: BF16 weight path. Mirrors the F16 path with TOPSATEN_DATA_BF16
+            // and accepts F32/F16/BF16 input + output (handler casts as needed).
+            if (w->type == GGML_TYPE_BF16 &&
+                (x->type == GGML_TYPE_BF16 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32) &&
+                (op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32)) ok = true;
             // MVP-3a: Q-typed weight, stored on device as F16 via dequant-on-load.
             if (gcu_q_supported(w->type) &&
                 (x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32) &&
@@ -3209,12 +3246,14 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (op->type  != GGML_TYPE_F32) return false;
 
             // Same dtype matrix as MUL_MAT for the (w, x) pair: F32×F32,
-            // F16×{F16,F32}, or Q-typed weight × {F16,F32}. Output is
-            // always F32 per the ggml MUL_MAT_ID contract.
+            // F16×{F16,F32}, BF16×{BF16,F16,F32}, or Q-typed weight ×
+            // {F16,F32}. Output is always F32 per the ggml MUL_MAT_ID contract.
             bool ok = false;
             if (w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32) ok = true;
             if (w->type == GGML_TYPE_F16 &&
                 (x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32)) ok = true;
+            if (w->type == GGML_TYPE_BF16 &&
+                (x->type == GGML_TYPE_BF16 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32)) ok = true;
             if (gcu_q_supported(w->type) &&
                 (x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_F32)) ok = true;
             if (!ok) return false;
