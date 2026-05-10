@@ -139,18 +139,54 @@ bool gcu_queued_ops_disabled() {
     return disabled;
 }
 
+// === RAII wrappers for tops handles =================================
+
+gcu_stream::gcu_stream(int device) {
+    TOPS_CHECK(topsSetDevice(device));
+    TOPS_CHECK(topsStreamCreate(&s_));
+}
+
+void gcu_stream::reset() {
+    if (s_) {
+        TOPS_CHECK(topsStreamSynchronize(s_));
+        TOPS_CHECK(topsStreamDestroy(s_));
+        s_ = nullptr;
+    }
+}
+
+gcu_stream::~gcu_stream() {
+    reset();
+}
+
+gcu_event::gcu_event(unsigned flags) {
+    TOPS_CHECK(topsEventCreateWithFlags(&e_, flags));
+}
+
+void gcu_event::reset() {
+    if (e_) {
+        TOPS_CHECK(topsEventDestroy(e_));
+        e_ = nullptr;
+    }
+}
+
+gcu_event::~gcu_event() {
+    reset();
+}
+
 // === Per-context state ==============================================
 
 #include <cstdio>
 
-ggml_backend_gcu_context::ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
+ggml_backend_gcu_context::ggml_backend_gcu_context(int32_t dev)
+    : device(dev),
+      compute_stream(dev),
+      copy_stream(dev),
+      pool(dev),
+      last_copy_event(topsEventDisableTiming),
+      last_compute_event(topsEventDisableTiming) {
     deferred_frees.reserve(64);
     TOPS_CHECK(topsSetDevice(device));
     gcu_global_init_inc();
-    TOPS_CHECK(topsStreamCreate(&compute_stream));
-    TOPS_CHECK(topsStreamCreate(&copy_stream));
-    TOPS_CHECK(topsEventCreateWithFlags(&last_copy_event,    topsEventDisableTiming));
-    TOPS_CHECK(topsEventCreateWithFlags(&last_compute_event, topsEventDisableTiming));
 
     char buf[GGML_GCU_NAME_MAX];
     snprintf(buf, sizeof(buf), "GCU%d", device);
@@ -165,6 +201,9 @@ ggml_backend_gcu_context::ggml_backend_gcu_context(int32_t dev) : device(dev), p
 }
 
 ggml_backend_gcu_context::~ggml_backend_gcu_context() {
+    // RAII wrappers (gcu_stream / gcu_event) reclaim their handles in
+    // their own destructors; the streams sync before destroy so we don't
+    // need explicit topsStreamSynchronize here.
     if (ones_n0) {
         pool.free(ones_n0, ones_n0_bytes);
         ones_n0 = nullptr;
@@ -175,24 +214,6 @@ ggml_backend_gcu_context::~ggml_backend_gcu_context() {
         pool.free(zero_bias, zero_bias_bytes);
         zero_bias = nullptr;
         zero_bias_bytes = 0;
-    }
-    if (last_compute_event) {
-        TOPS_CHECK(topsEventDestroy(last_compute_event));
-        last_compute_event = nullptr;
-    }
-    if (last_copy_event) {
-        TOPS_CHECK(topsEventDestroy(last_copy_event));
-        last_copy_event = nullptr;
-    }
-    if (copy_stream) {
-        TOPS_CHECK(topsStreamSynchronize(copy_stream));
-        TOPS_CHECK(topsStreamDestroy(copy_stream));
-        copy_stream = nullptr;
-    }
-    if (compute_stream) {
-        TOPS_CHECK(topsStreamSynchronize(compute_stream));
-        TOPS_CHECK(topsStreamDestroy(compute_stream));
-        compute_stream = nullptr;
     }
     gcu_global_init_dec();
 }

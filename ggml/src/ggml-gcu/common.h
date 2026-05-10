@@ -118,6 +118,55 @@ bool gcu_async_disabled();
 // pattern (per-op topsStreamSynchronize + immediate pool.free).
 bool gcu_queued_ops_disabled();
 
+// === RAII wrappers for tops handles =================================
+//
+// MVP-5c, mirrors CANN commit 2376b7758 (ACL handle smart pointers).
+// gcu_stream / gcu_event own their respective topsrt handle by RAII —
+// destruction releases the handle automatically, the move-ctor leaves
+// the source in nullptr state.
+//
+// The wrappers implicitly convert back to the underlying topsStream_t /
+// topsEvent_t so existing call sites that take a stream / event by raw
+// handle continue to work without edits.
+
+class gcu_stream {
+public:
+    gcu_stream() = default;
+    explicit gcu_stream(int device);
+    ~gcu_stream();
+    gcu_stream(const gcu_stream &) = delete;
+    gcu_stream & operator=(const gcu_stream &) = delete;
+    gcu_stream(gcu_stream && other) noexcept : s_(other.s_) { other.s_ = nullptr; }
+    gcu_stream & operator=(gcu_stream && other) noexcept {
+        if (this != &other) { reset(); s_ = other.s_; other.s_ = nullptr; }
+        return *this;
+    }
+    operator topsStream_t() const { return s_; }
+    topsStream_t get() const { return s_; }
+private:
+    void reset();
+    topsStream_t s_ = nullptr;
+};
+
+class gcu_event {
+public:
+    gcu_event() = default;
+    explicit gcu_event(unsigned flags);
+    ~gcu_event();
+    gcu_event(const gcu_event &) = delete;
+    gcu_event & operator=(const gcu_event &) = delete;
+    gcu_event(gcu_event && other) noexcept : e_(other.e_) { other.e_ = nullptr; }
+    gcu_event & operator=(gcu_event && other) noexcept {
+        if (this != &other) { reset(); e_ = other.e_; other.e_ = nullptr; }
+        return *this;
+    }
+    operator topsEvent_t() const { return e_; }
+    topsEvent_t get() const { return e_; }
+private:
+    void reset();
+    topsEvent_t e_ = nullptr;
+};
+
 // === Per-context state ==============================================
 
 #define GGML_GCU_NAME_MAX 64
@@ -126,8 +175,8 @@ struct ggml_backend_gcu_context {
     int32_t      device      = 0;
     std::string  name;          // "GCU0", "GCU1", ...
     std::string  description;   // populated from topsGetDeviceProperties
-    topsStream_t compute_stream = nullptr;
-    topsStream_t copy_stream    = nullptr;
+    gcu_stream   compute_stream;
+    gcu_stream   copy_stream;
     gcu_pool     pool;
 
     // Per-context zero-filled scratch used as bias for topsatenLinear's
@@ -149,8 +198,8 @@ struct ggml_backend_gcu_context {
     // last_compute_event:   recorded on compute_stream at end of graph_compute
     // copy_event_armed:     guards the first wait — recording-without-arming is undefined SDK behavior
     // compute_event_armed:  symmetric guard for get_tensor_async; set by graph_compute (Task 3)
-    topsEvent_t  last_copy_event    = nullptr;
-    topsEvent_t  last_compute_event = nullptr;
+    gcu_event    last_copy_event;
+    gcu_event    last_compute_event;
     bool         copy_event_armed   = false;
     bool         compute_event_armed = false;
 
