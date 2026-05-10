@@ -833,6 +833,93 @@ static int test_hardsigmoid(ggml_backend_t gcu) {
     return run_unary_test(gcu, {"HARDSIGMOID", 307, 1e-5f, 1e-5f, ggml_hardsigmoid, ref_hardsigmoid});
 }
 
+// Tranche D1: element-wise unary math (SQR, SQRT, LOG, SIN, COS).
+// SQR/SIN/COS work on signed inputs; SQRT/LOG need a positive shift to
+// avoid NaN at the boundary. Each op uses the standard 1D smoke harness
+// but with the "shift" knob letting the caller force positive input.
+struct unary_math_spec {
+    const char *  label;
+    int           seed;
+    float         atol;
+    float         rtol;
+    float         input_shift;   // added to fill_random_f32 to enforce positivity
+    ggml_tensor * (*build_op)(ggml_context * ctx, ggml_tensor * a);
+    float         (*ref)(float x);
+};
+
+static int run_unary_math_test(ggml_backend_t gcu, const unary_math_spec & s) {
+    const size_t n = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_tensor * c = s.build_op(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "%s: alloc failed\n", s.label); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, (uint32_t) s.seed);
+    for (size_t i = 0; i < n; i++) ha[i] += s.input_shift;
+    for (size_t i = 0; i < n; i++) expected[i] = s.ref(ha[i]);
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: compute failed\n", s.label);
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], s.atol, s.rtol)) {
+            if (bad < 5) fprintf(stderr, "%s: mismatch idx=%zu got=%f want=%f\n",
+                                 s.label, i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "%s: %d mismatches (max_abs_err=%f)\n", s.label, bad, max_err);
+        return 1;
+    }
+    printf("%s: ok (%zu elements, max_abs_err=%f)\n", s.label, n, max_err);
+    return 0;
+}
+
+static float ref_sqr (float x) { return x * x; }
+static float ref_sqrt(float x) { return std::sqrt(x); }
+static float ref_log (float x) { return std::log(x); }
+static float ref_sin (float x) { return std::sin(x); }
+static float ref_cos (float x) { return std::cos(x); }
+
+static int test_sqr (ggml_backend_t gcu) {
+    return run_unary_math_test(gcu, {"SQR",  401, 1e-5f, 1e-5f, 0.0f, ggml_sqr,  ref_sqr });
+}
+static int test_sqrt(ggml_backend_t gcu) {
+    // shift to [1, 3] so input is strictly positive
+    return run_unary_math_test(gcu, {"SQRT", 402, 1e-5f, 1e-5f, 2.0f, ggml_sqrt, ref_sqrt});
+}
+static int test_log (ggml_backend_t gcu) {
+    return run_unary_math_test(gcu, {"LOG",  403, 1e-5f, 1e-5f, 2.0f, ggml_log,  ref_log });
+}
+static int test_sin (ggml_backend_t gcu) {
+    return run_unary_math_test(gcu, {"SIN",  404, 1e-5f, 1e-5f, 0.0f, ggml_sin,  ref_sin });
+}
+static int test_cos (ggml_backend_t gcu) {
+    return run_unary_math_test(gcu, {"COS",  405, 1e-5f, 1e-5f, 0.0f, ggml_cos,  ref_cos });
+}
+
 // MUL_MAT_MIXED variant with F16 input (instead of F32): F16w × F16x -> F32.
 // Fills the third dtype combo in the F16-weight family of MUL_MAT:
 //   F32w × F32x → F32   (test_mul_mat)
@@ -3465,6 +3552,11 @@ int main() {
     rc |= test_top_k_vocab(gcu);
     rc |= test_argsort(gcu);
     rc |= test_argsort_vocab(gcu);
+    rc |= test_sqr(gcu);
+    rc |= test_sqrt(gcu);
+    rc |= test_log(gcu);
+    rc |= test_sin(gcu);
+    rc |= test_cos(gcu);
     rc |= test_async_overlap(gcu);
 
     const bool bench_ran = (rc == 0 && getenv("GCU_BENCH") != nullptr);

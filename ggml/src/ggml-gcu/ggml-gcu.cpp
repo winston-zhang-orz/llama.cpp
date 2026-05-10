@@ -2240,6 +2240,57 @@ static bool gcu_op_hardsigmoid(ggml_backend_gcu_context * ctx, ggml_tensor * dst
     return true;
 }
 
+// MVP-6 / Tranche D1: element-wise unary math ops.
+// Same shape as SILU template — same dtype in/out, single-source contiguous.
+// Each is a thin wrapper around the corresponding topsaten kernel.
+//
+// SDK note: ggml's GGML_OP_SQR maps to topsatenSquare (PyTorch torch.square).
+
+static bool gcu_op_sqr(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenSquare(out, in, ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_sqrt(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenSqrt(out, in, ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_log(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenLog(out, in, ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_sin(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenSin(out, in, ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_cos(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+    TOPSATEN_CHECK(topsatenCos(out, in, ctx->compute_stream));
+    return true;
+}
+
 // MVP-5b: sampling helper ops (ARGMAX / TOP_K / ARGSORT).
 //
 // These reduce / sort along ggml's innermost dim (ne[0]) and produce I32
@@ -2419,6 +2470,16 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_top_k(ctx, node);
         case GGML_OP_ARGSORT:
             return gcu_op_argsort(ctx, node);
+        case GGML_OP_SQR:
+            return gcu_op_sqr(ctx, node);
+        case GGML_OP_SQRT:
+            return gcu_op_sqrt(ctx, node);
+        case GGML_OP_LOG:
+            return gcu_op_log(ctx, node);
+        case GGML_OP_SIN:
+            return gcu_op_sin(ctx, node);
+        case GGML_OP_COS:
+            return gcu_op_cos(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -2798,6 +2859,18 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
             const int32_t order = ((const int32_t *) op->op_params)[0];
             if (order != GGML_SORT_ORDER_ASC && order != GGML_SORT_ORDER_DESC) return false;
+            return true;
+        }
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_SIN:
+        case GGML_OP_COS: {
+            // Element-wise unary, same dtype in/out, contiguous. F32 + F16
+            // both accepted by these topsaten kernels in this SDK version.
+            if (!gcu_dtype_supported(op->src[0]->type)) return false;
+            if (op->src[0]->type != op->type) return false;
+            if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
             return true;
         }
         case GGML_OP_ROPE: {
