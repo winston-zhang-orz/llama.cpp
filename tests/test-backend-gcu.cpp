@@ -3947,6 +3947,82 @@ static int test_softmax_bf16(ggml_backend_t gcu) {
     return 0;
 }
 
+// MVP-5a/4: ROPE BF16. The cos/sin cache is built host-side in F32 and
+// rounded to BF16 before H->D, mirroring the F16 path the handler already
+// took. Reference rotates BF16-rounded inputs through F32 trig.
+static int test_rope_bf16(ggml_backend_t gcu) {
+    const int64_t head_dim = 64, n_heads = 8, n_tokens = 16;
+    const int     n_dims = (int) head_dim;
+    const float   freq_base = 10000.0f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, head_dim, n_heads, n_tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * c   = ggml_rope(ctx, a, pos, n_dims, GGML_ROPE_TYPE_NORMAL);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ROPE_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    const size_t n = (size_t) head_dim * n_heads * n_tokens;
+    std::vector<float>       ha_f32(n), expected(n);
+    std::vector<ggml_bf16_t> ha(n), hc(n);
+    std::vector<int32_t>     hp(n_tokens);
+    fill_random_f32(ha_f32.data(), n, 1361);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), n);
+    for (int64_t t = 0; t < n_tokens; t++) hp[t] = (int32_t) t;
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        const int p_idx = hp[t];
+        for (int64_t h = 0; h < n_heads; h++) {
+            const ggml_bf16_t * xrow = ha.data()       + (t * n_heads + h) * head_dim;
+            float             * yrow = expected.data() + (t * n_heads + h) * head_dim;
+            for (int i = 0; i < n_dims; i += 2) {
+                const float theta = std::pow(freq_base, -((float) i) / (float) n_dims);
+                const float angle = (float) p_idx * theta;
+                const float c1 = std::cos(angle), s1 = std::sin(angle);
+                const float x0 = ggml_bf16_to_fp32(xrow[i]);
+                const float x1 = ggml_bf16_to_fp32(xrow[i + 1]);
+                yrow[i]     = x0 * c1 - x1 * s1;
+                yrow[i + 1] = x0 * s1 + x1 * c1;
+            }
+            for (int i = n_dims; i < head_dim; i++) yrow[i] = ggml_bf16_to_fp32(xrow[i]);
+        }
+    }
+
+    ggml_backend_tensor_set(a,   ha.data(), 0, n * sizeof(ggml_bf16_t));
+    ggml_backend_tensor_set(pos, hp.data(), 0, n_tokens * sizeof(int32_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ROPE_BF16: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(ggml_bf16_t));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float got = ggml_bf16_to_fp32(hc[i]);
+        const float err = std::fabs(got - expected[i]);
+        if (err > max_err) max_err = err;
+        // ROPE is a 2x2 mix of x0/x1 with cos/sin; BF16 rounds both inputs
+        // and the trig table, so per-element drift is ~2x the elementwise
+        // case. 2e-2 covers it.
+        if (!close_enough(got, expected[i], 2e-2f, 2e-2f)) {
+            if (bad < 5) fprintf(stderr, "ROPE_BF16: mismatch idx=%zu got=%f want=%f\n", i, got, expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ROPE_BF16: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("ROPE_BF16: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
 // MVP-5b: ARGMAX / TOP_K / ARGSORT smoke tests.
 
 // ARGMAX. Input rank-2 [ne0, ne1] F32 → output rank-1 [ne1] I32.
@@ -4893,6 +4969,7 @@ int main() {
     rc |= test_rms_norm_bf16(gcu);
     rc |= test_norm_bf16(gcu);
     rc |= test_softmax_bf16(gcu);
+    rc |= test_rope_bf16(gcu);
     rc |= test_mul_mat_mixed(gcu);
     rc |= test_mul_mat_mixed_f16in(gcu);
     rc |= test_mul_mat_id(gcu);
