@@ -3,7 +3,9 @@
 // Helpers shared by every translation unit in the GCU backend: error-check
 // macros, dtype mapping, tensor-descriptor builder, scratch-release helper,
 // rollback flag accessors, and the cross-cutting per-op helpers
-// (broadcast / aliasing / dtype gates).
+// (broadcast / aliasing / dtype gates). Also hosts the per-context state
+// struct (ggml_backend_gcu_context) so the buffer / op TUs can reach into
+// it directly.
 //
 // File layout per docs/superpowers/specs/2026-05-10-gcu-mvp5c-file-split-design.md.
 
@@ -24,12 +26,13 @@
 using namespace topsaten;
 using namespace topsvllm;
 
+#include "gcu_pool.h"
+
 #include <cstddef>
 #include <cstdint>
-
-// Forward decls — full ggml_backend_gcu_context lives in ggml-gcu.cpp until
-// commit 2 lifts the pool out into its own header.
-struct ggml_backend_gcu_context;
+#include <string>
+#include <utility>
+#include <vector>
 
 // === Error handling =================================================
 
@@ -114,6 +117,58 @@ bool gcu_async_disabled();
 // MVP-4b: GGML_GCU_NO_QUEUED_OPS=1 keeps the pre-MVP-4b sync-and-free
 // pattern (per-op topsStreamSynchronize + immediate pool.free).
 bool gcu_queued_ops_disabled();
+
+// === Per-context state ==============================================
+
+#define GGML_GCU_NAME_MAX 64
+
+struct ggml_backend_gcu_context {
+    int32_t      device      = 0;
+    std::string  name;          // "GCU0", "GCU1", ...
+    std::string  description;   // populated from topsGetDeviceProperties
+    topsStream_t compute_stream = nullptr;
+    topsStream_t copy_stream    = nullptr;
+    gcu_pool     pool;
+
+    // Per-context zero-filled scratch used as bias for topsatenLinear's
+    // mandatory bias parameter. Grows on demand to the largest output row
+    // count seen so far, in F32 (largest dtype we use), and reinterpreted
+    // for F16 calls. Only ever flows through compute_stream, so no lock
+    // is needed.
+    void *  zero_bias       = nullptr;
+    size_t  zero_bias_bytes = 0;
+
+    // Per-context F32 ones buffer used as the gamma argument to
+    // topsvllmRmsNorm (which requires a real weight tensor).
+    void *  ones_n0         = nullptr;
+    size_t  ones_n0_bytes   = 0;
+    int64_t ones_n0_count   = 0;
+
+    // MVP-4a: async H<->D plumbing.
+    // last_copy_event:      recorded on copy_stream after each set_tensor_async H->D enqueue
+    // last_compute_event:   recorded on compute_stream at end of graph_compute
+    // copy_event_armed:     guards the first wait — recording-without-arming is undefined SDK behavior
+    // compute_event_armed:  symmetric guard for get_tensor_async; set by graph_compute (Task 3)
+    topsEvent_t  last_copy_event    = nullptr;
+    topsEvent_t  last_compute_event = nullptr;
+    bool         copy_event_armed   = false;
+    bool         compute_event_armed = false;
+
+    // MVP-4b: scratch frees deferred to end of graph_compute so kernels
+    // queue without per-op host synchronize and the next op's pool.alloc
+    // can't reuse a buffer the previous op's kernel is still reading.
+    std::vector<std::pair<void *, size_t>> deferred_frees;
+
+    void defer_free(void * p, size_t sz) {
+        if (p) deferred_frees.emplace_back(p, sz);
+    }
+
+    explicit ggml_backend_gcu_context(int32_t dev);
+    ~ggml_backend_gcu_context();
+
+    ggml_backend_gcu_context(const ggml_backend_gcu_context &) = delete;
+    ggml_backend_gcu_context & operator=(const ggml_backend_gcu_context &) = delete;
+};
 
 // === Scratch release ================================================
 

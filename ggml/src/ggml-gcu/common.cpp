@@ -138,3 +138,73 @@ bool gcu_queued_ops_disabled() {
     static const bool disabled = (getenv("GGML_GCU_NO_QUEUED_OPS") != nullptr);
     return disabled;
 }
+
+// === Per-context state ==============================================
+
+#include <cstdio>
+
+ggml_backend_gcu_context::ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
+    deferred_frees.reserve(64);
+    TOPS_CHECK(topsSetDevice(device));
+    gcu_global_init_inc();
+    TOPS_CHECK(topsStreamCreate(&compute_stream));
+    TOPS_CHECK(topsStreamCreate(&copy_stream));
+    TOPS_CHECK(topsEventCreateWithFlags(&last_copy_event,    topsEventDisableTiming));
+    TOPS_CHECK(topsEventCreateWithFlags(&last_compute_event, topsEventDisableTiming));
+
+    char buf[GGML_GCU_NAME_MAX];
+    snprintf(buf, sizeof(buf), "GCU%d", device);
+    name = buf;
+
+    topsDeviceProp_t prop{};
+    if (topsGetDeviceProperties(&prop, device) == topsSuccess) {
+        description = prop.name;
+    } else {
+        description = "Enflame GCU";
+    }
+}
+
+ggml_backend_gcu_context::~ggml_backend_gcu_context() {
+    if (ones_n0) {
+        pool.free(ones_n0, ones_n0_bytes);
+        ones_n0 = nullptr;
+        ones_n0_bytes = 0;
+        ones_n0_count = 0;
+    }
+    if (zero_bias) {
+        pool.free(zero_bias, zero_bias_bytes);
+        zero_bias = nullptr;
+        zero_bias_bytes = 0;
+    }
+    if (last_compute_event) {
+        TOPS_CHECK(topsEventDestroy(last_compute_event));
+        last_compute_event = nullptr;
+    }
+    if (last_copy_event) {
+        TOPS_CHECK(topsEventDestroy(last_copy_event));
+        last_copy_event = nullptr;
+    }
+    if (copy_stream) {
+        TOPS_CHECK(topsStreamSynchronize(copy_stream));
+        TOPS_CHECK(topsStreamDestroy(copy_stream));
+        copy_stream = nullptr;
+    }
+    if (compute_stream) {
+        TOPS_CHECK(topsStreamSynchronize(compute_stream));
+        TOPS_CHECK(topsStreamDestroy(compute_stream));
+        compute_stream = nullptr;
+    }
+    gcu_global_init_dec();
+}
+
+// === Scratch release ================================================
+
+void gcu_release_scratch(ggml_backend_gcu_context * ctx, void * p, size_t sz) {
+    if (!p) return;
+    if (gcu_queued_ops_disabled()) {
+        TOPS_CHECK(topsStreamSynchronize(ctx->compute_stream));
+        ctx->pool.free(p, sz);
+    } else {
+        ctx->defer_free(p, sz);
+    }
+}

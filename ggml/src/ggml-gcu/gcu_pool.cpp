@@ -1,5 +1,6 @@
 // ggml-gcu: LIFO size-keyed device-memory pool — implementation.
 
+#include "common.h"
 #include "gcu_pool.h"
 
 void * gcu_pool::alloc(size_t size) {
