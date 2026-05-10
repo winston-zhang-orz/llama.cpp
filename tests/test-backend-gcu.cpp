@@ -2860,6 +2860,145 @@ static void bench_mul_mat_id_f16(ggml_backend_t gcu) {
     ggml_free(ctx);
 }
 
+// FLASH_ATTN_EXT smoke. Computes attn(Q, K, V, mask) where K and V are F16
+// (the common decode-time case after the kv-cache cast). Q is F32, output
+// is F32. Tests one decode-shape variant (n_q==1, GQA) and one prefill
+// shape (small n_q, MHA).
+//
+// ggml's FLASH_ATTN_EXT contract:
+//   Q  ne = [head_dim, n_q,  n_head,    n_batch]
+//   K  ne = [head_dim, n_kv, n_head_kv, n_batch]   (broadcast on head: n_head % n_head_kv == 0)
+//   V  ne = [head_dim, n_kv, n_head_kv, n_batch]
+//   mask  = [n_kv, n_q, ?, ?]   F16
+//   out ne = [head_dim, n_head, n_q, n_batch]      (permuted vs Q)
+//
+// Reference: row-by-row scaled dot-product softmax with the same lossy
+// F16 K/V the device sees.
+static int test_flash_attn_ext_shape(ggml_backend_t gcu,
+                                     int64_t head_dim, int64_t n_head,
+                                     int64_t n_head_kv, int64_t n_kv,
+                                     int64_t n_q, int64_t n_batch,
+                                     const char * label, uint32_t seed) {
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 64 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q,  n_head,    n_batch);
+    ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv, n_head_kv, n_batch);
+    ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv, n_head_kv, n_batch);
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+
+    const float scale = 1.0f / std::sqrt((float) head_dim);
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "%s: alloc failed\n", label); ggml_free(ctx); return 1; }
+
+    const size_t nq    = (size_t) head_dim * n_q  * n_head    * n_batch;
+    const size_t nkv   = (size_t) head_dim * n_kv * n_head_kv * n_batch;
+    const size_t nmask = (size_t) n_kv * n_q;
+    const size_t nout  = (size_t) head_dim * n_head * n_q * n_batch;
+
+    std::vector<float>       hq_f32(nq), hk_f32(nkv), hv_f32(nkv), hmask_f32(nmask);
+    std::vector<ggml_fp16_t> hk(nkv), hv(nkv), hmask(nmask);
+    fill_random_f32(hq_f32.data(),    nq,    seed + 0);
+    fill_random_f32(hk_f32.data(),    nkv,   seed + 1);
+    fill_random_f32(hv_f32.data(),    nkv,   seed + 2);
+    // Mask: zeros (no-op causal). Use 0.0 for everything in the test.
+    for (size_t i = 0; i < nmask; i++) hmask_f32[i] = 0.0f;
+    ggml_fp32_to_fp16_row(hk_f32.data(),    hk.data(),    nkv);
+    ggml_fp32_to_fp16_row(hv_f32.data(),    hv.data(),    nkv);
+    ggml_fp32_to_fp16_row(hmask_f32.data(), hmask.data(), nmask);
+
+    // CPU reference. Use the same lossy F16 K/V the device sees.
+    std::vector<float> hk_lossy(nkv), hv_lossy(nkv);
+    for (size_t i = 0; i < nkv; i++) {
+        hk_lossy[i] = ggml_fp16_to_fp32(hk[i]);
+        hv_lossy[i] = ggml_fp16_to_fp32(hv[i]);
+    }
+    std::vector<float> expected(nout, 0.0f);
+    const int64_t kv_per_q = n_head / n_head_kv;
+    std::vector<double> scores(n_kv);
+    for (int64_t b = 0; b < n_batch; b++) {
+        for (int64_t h = 0; h < n_head; h++) {
+            const int64_t hkv = h / kv_per_q;
+            for (int64_t iq = 0; iq < n_q; iq++) {
+                const float * qrow = hq_f32.data() + ((b * n_head + h) * n_q + iq) * head_dim;
+                // Scores = scale * (Q @ K^T) + mask along kv_seq.
+                double smax = -INFINITY;
+                for (int64_t ik = 0; ik < n_kv; ik++) {
+                    const float * krow = hk_lossy.data() + ((b * n_head_kv + hkv) * n_kv + ik) * head_dim;
+                    double s = 0.0;
+                    for (int64_t d = 0; d < head_dim; d++) s += (double) qrow[d] * (double) krow[d];
+                    s = s * (double) scale + (double) ggml_fp16_to_fp32(hmask[iq * n_kv + ik]);
+                    scores[ik] = s;
+                    if (s > smax) smax = s;
+                }
+                double sum = 0.0;
+                for (int64_t ik = 0; ik < n_kv; ik++) {
+                    scores[ik] = std::exp(scores[ik] - smax);
+                    sum += scores[ik];
+                }
+                const double inv_sum = 1.0 / sum;
+                // Out row layout per ggml FA: ne = [head_dim, n_head, n_q, n_batch]
+                // → element index of out[d] for (b, h, iq) is
+                //   ((b * n_q + iq) * n_head + h) * head_dim + d.
+                float * orow = expected.data() + ((b * n_q + iq) * n_head + h) * head_dim;
+                for (int64_t d = 0; d < head_dim; d++) {
+                    double acc = 0.0;
+                    for (int64_t ik = 0; ik < n_kv; ik++) {
+                        const float * vrow = hv_lossy.data() + ((b * n_head_kv + hkv) * n_kv + ik) * head_dim;
+                        acc += scores[ik] * inv_sum * (double) vrow[d];
+                    }
+                    orow[d] = (float) acc;
+                }
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(q,    hq_f32.data(), 0, nq    * sizeof(float));
+    ggml_backend_tensor_set(k,    hk.data(),     0, nkv   * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(v,    hv.data(),     0, nkv   * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(mask, hmask.data(),  0, nmask * sizeof(ggml_fp16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: compute failed\n", label); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    std::vector<float> hc(nout);
+    ggml_backend_tensor_get(out, hc.data(), 0, nout * sizeof(float));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < nout; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        // Attention has an n_kv-wide reduction in F16. Allow ~1e-2 abs/rel.
+        if (!close_enough(hc[i], expected[i], 1e-2f, 1e-2f)) {
+            if (bad < 5) fprintf(stderr, "%s: mismatch idx=%zu got=%f want=%f\n", label, i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "%s: %d mismatches (max_abs_err=%f)\n", label, bad, max_err); return 1; }
+    printf("%s: ok (%zu elements, max_abs_err=%f)\n", label, nout, max_err);
+    return 0;
+}
+
+static int test_flash_attn_ext_small(ggml_backend_t gcu) {
+    // L1: small MHA shape, head_dim=64, n_head=4, n_kv=32, n_q=8.
+    return test_flash_attn_ext_shape(gcu, 64, 4, 4, 32, 8, 1, "FLASH_ATTN_EXT_SMALL", 901);
+}
+
+static int test_flash_attn_ext_decode(ggml_backend_t gcu) {
+    // L2/L3: GQA decode shape (n_q==1) at Llama-3-class head_dim=128, n_head=16, n_head_kv=8.
+    return test_flash_attn_ext_shape(gcu, 128, 16, 8, 128, 1, 1, "FLASH_ATTN_EXT_DECODE_GQA", 902);
+}
+
 static void bench_all(ggml_backend_t gcu) {
     if (getenv("GCU_BENCH") == nullptr) return;
     printf("---- per-op micro-bench (decode-step shapes; warmup+timed) ----\n");
@@ -2935,6 +3074,8 @@ int main() {
     rc |= test_mul_mat_id_gemma4_shape(gcu);
     rc |= test_mul_mat_id_q4k_gemma4(gcu);
     rc |= test_moe_gate_up_geglu(gcu);
+    rc |= test_flash_attn_ext_small(gcu);
+    rc |= test_flash_attn_ext_decode(gcu);
     rc |= test_async_overlap(gcu);
 
     const bool bench_ran = (rc == 0 && getenv("GCU_BENCH") != nullptr);

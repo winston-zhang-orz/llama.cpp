@@ -1941,6 +1941,223 @@ static bool gcu_op_soft_max(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// FLASH_ATTN_EXT. Fused scaled-dot-product attention.
+//
+// ggml contract:
+//   src[0] q    [head_dim,    n_q,  n_head,    n_batch]
+//   src[1] k    [head_dim,    n_kv, n_head_kv, n_batch]   (n_head % n_head_kv == 0)
+//   src[2] v    [head_dim,    n_kv, n_head_kv, n_batch]
+//   src[3] mask [n_kv,        n_q,  ne32,      ne33]      F16 (or null)
+//   dst         [head_dim,    n_head, n_q,     n_batch]   !! permuted output !!
+//   op_params: float scale, float max_bias, float logit_softcap, int32 prec
+//
+// Backend: topsatenScaledDotProductAttention expects PyTorch layout
+// [batch, head_num, seq_len, head_size]. ggml's reverse-fastest-first ne
+// for q is [head_dim, n_q, n_head, n_batch], i.e. PyTorch
+// [n_batch, n_head, n_q, head_dim] when the tensor is contiguous. The
+// real call site in llama-graph.cpp passes ggml_permute(0, 2, 1, 3) views,
+// so q/k/v arrive with non-contiguous strides; we materialize each into a
+// PyTorch-contiguous F16 scratch via topsatenTo before SDP (topsatenTo
+// folds the dtype cast and the stride collapse into a single op).
+//
+// The dst memory is contiguous for ne=[head_dim, n_head, n_q, n_batch],
+// i.e. PyTorch [n_batch, n_q, n_head, head_dim] dense. SDP returns its
+// output in [n_batch, n_head, n_q, head_dim] order; we land it in a
+// contiguous scratch, then "logically permute" by re-describing the
+// scratch as [n_batch, n_q, n_head, head_dim] with strides
+// [n_head*n_q*head_dim, head_dim, n_q*head_dim, 1] — the same memory
+// addressed in dst's [b][q][h][d] order — and feed it to topsatenCopy
+// which writes into the dst layout element by element.
+//
+// supports_op gates out cases this handler doesn't cover (max_bias != 0
+// for ALiBi, logit_softcap != 0, sinks src[4], non-F16 mask, K/V types
+// other than F16, etc.). Within those gates the handler always succeeds.
+static bool gcu_op_flash_attn_ext(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * q    = dst->src[0];
+    ggml_tensor * k    = dst->src[1];
+    ggml_tensor * v    = dst->src[2];
+    ggml_tensor * mask = dst->src[3];
+
+    float scale, max_bias, logit_softcap;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    GGML_ASSERT(max_bias      == 0.0f);   // ALiBi: gated out by supports_op
+    GGML_ASSERT(logit_softcap == 0.0f);   // softcap: gated out by supports_op
+
+    // Tensor sizes (ggml fastest-first).
+    const int64_t head_dim  = q->ne[0];
+    const int64_t n_q       = q->ne[1];
+    const int64_t n_head    = q->ne[2];
+    const int64_t n_batch   = q->ne[3];
+    const int64_t n_kv      = k->ne[1];
+    const int64_t n_head_kv = k->ne[2];
+    GGML_ASSERT(v->ne[0] == head_dim);
+    GGML_ASSERT(v->ne[1] == n_kv);
+    GGML_ASSERT(v->ne[2] == n_head_kv);
+    GGML_ASSERT(v->ne[3] == n_batch);
+    GGML_ASSERT(n_head % n_head_kv == 0);
+
+    // dst ne (per ggml_flash_attn_ext): [head_dim, n_head, n_q, n_batch].
+    GGML_ASSERT(dst->ne[0] == head_dim);
+    GGML_ASSERT(dst->ne[1] == n_head);
+    GGML_ASSERT(dst->ne[2] == n_q);
+    GGML_ASSERT(dst->ne[3] == n_batch);
+
+    // Materialize Q/K/V into PyTorch-contiguous F16 scratches. Q/K/V
+    // typically come in as ggml_permute(0, 2, 1, 3) views — non-contiguous.
+    // Topsaten SDP expects standard [B, H, Seq, D] contiguous layout, so we
+    // collapse strides via topsatenTo (which also handles the F32→F16 cast
+    // for Q in the common F32-Q decode case).
+    auto materialize_f16 = [&](ggml_tensor * t,
+                               int64_t B, int64_t H, int64_t S, int64_t D,
+                               void *& out_scratch, size_t & out_bytes) -> topsatenTensor {
+        // Build the source descriptor in [B, H, S, D] PyTorch order using
+        // the tensor's raw ggml strides. We can't go through
+        // make_topsaten_tensor() because it folds trailing-1 dims away
+        // (via ggml_n_dims), and topsatenTo requires src and dst rank to
+        // match. Build rank-4 explicitly to match dst_t below.
+        const size_t bpe = ggml_type_size(t->type);
+        int64_t sd[4] = { t->ne[3], t->ne[2], t->ne[1], t->ne[0] };
+        int64_t ss[4] = { (int64_t) (t->nb[3] / bpe), (int64_t) (t->nb[2] / bpe),
+                          (int64_t) (t->nb[1] / bpe), (int64_t) (t->nb[0] / bpe) };
+        GGML_ASSERT(sd[0] == B && sd[1] == H && sd[2] == S && sd[3] == D);
+        topsatenTensor src_t(topsatenSize_t(sd, 4), topsatenSize_t(ss, 4),
+                             ggml_to_topsaten_dtype(t->type), t->data);
+
+        out_bytes   = (size_t) B * H * S * D * sizeof(uint16_t);
+        out_scratch = ctx->pool.alloc(out_bytes);
+
+        int64_t dd[4] = { B, H, S, D };
+        int64_t ds[4] = { H * S * D, S * D, D, 1 };
+        topsatenTensor dst_t(topsatenSize_t(dd, 4), topsatenSize_t(ds, 4),
+                             TOPSATEN_DATA_FP16, out_scratch);
+        topsatenDataType_t target = TOPSATEN_DATA_FP16;
+        TOPSATEN_CHECK(topsatenTo(dst_t, src_t, target,
+                                  false, true,
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
+        return dst_t;
+    };
+
+    void * q_buf = nullptr; size_t q_bytes = 0;
+    void * k_buf = nullptr; size_t k_bytes = 0;
+    void * v_buf = nullptr; size_t v_bytes = 0;
+    topsatenTensor q_t = materialize_f16(q, n_batch, n_head,    n_q,  head_dim, q_buf, q_bytes);
+    topsatenTensor k_t = materialize_f16(k, n_batch, n_head_kv, n_kv, head_dim, k_buf, k_bytes);
+    topsatenTensor v_t = materialize_f16(v, n_batch, n_head_kv, n_kv, head_dim, v_buf, v_bytes);
+
+    // Mask: always F16 per ggml's FLASH_ATTN_EXT contract. SDP wants
+    // [batch, q_head, q_seq_len, kv_seq_len]; ggml mask ne is
+    // [n_kv, n_q, ne32, ne33] (ne32/ne33 are 1 for the standard causal
+    // mask, with broadcast on q-head and batch handled by stride==0 logic
+    // in topsaten). Build rank-4 explicitly.
+    topsatenTensor mask_t;
+    bool have_mask = (mask != nullptr);
+    if (have_mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        const size_t mbpe = ggml_type_size(mask->type);
+        // Mask ne (ggml fastest-first): [n_kv, n_q, m_h, m_b]
+        // PyTorch order [m_b, m_h, n_q, n_kv].
+        int64_t md[4] = { mask->ne[3], mask->ne[2], mask->ne[1], mask->ne[0] };
+        int64_t ms[4] = { (int64_t) (mask->nb[3] / mbpe),
+                          (int64_t) (mask->nb[2] / mbpe),
+                          (int64_t) (mask->nb[1] / mbpe),
+                          (int64_t) (mask->nb[0] / mbpe) };
+        mask_t = topsatenTensor(topsatenSize_t(md, 4), topsatenSize_t(ms, 4),
+                                TOPSATEN_DATA_FP16, mask->data);
+    }
+
+    // SDP output scratch in F16, [B, H, n_q, D] PyTorch-contiguous.
+    // We cast and permute into dst after SDP; the scratch is always
+    // contiguous so SDP sees the canonical layout it expects.
+    const size_t out_f16_bytes = (size_t) n_batch * n_head * n_q * head_dim * sizeof(uint16_t);
+    void * out_f16 = ctx->pool.alloc(out_f16_bytes);
+    int64_t od[4] = { n_batch, n_head, n_q, head_dim };
+    int64_t os[4] = { n_head * n_q * head_dim, n_q * head_dim, head_dim, 1 };
+    topsatenTensor sdp_out(topsatenSize_t(od, 4), topsatenSize_t(os, 4),
+                           TOPSATEN_DATA_FP16, out_f16);
+
+    topsatenScalar_t scale_s;
+    scale_s.dtype = TOPSATEN_DATA_FP32;
+    scale_s.fval  = (double) scale;
+
+    // Empty-mask sentinel: pass a default-constructed tensor (.data ==
+    // nullptr) when the call has no mask. Topsaten interprets that as
+    // "no attn_mask".
+    topsatenTensor empty_mask;
+    TOPSATEN_CHECK(topsatenScaledDotProductAttention(
+        sdp_out, q_t, k_t, v_t,
+        have_mask ? mask_t : empty_mask,
+        /* dropout_p */ 0.0,
+        /* is_causal */ false,           // mask carries causal info already
+        scale_s,
+        ctx->compute_stream));
+
+    // Permute SDP output [B, H, Q, D] into dst layout [B, Q, H, D].
+    // dst memory is contiguous for ne=[head_dim, n_head, n_q, n_batch],
+    // i.e. dense in PyTorch order [n_batch, n_q, n_head, head_dim].
+    // topsatenPermute writes out[i_0, i_1, ...] = in[i_{dims[0]}, ...]; we
+    // want out[b, q, h, d] = in[b, h, q, d] → dims = [0, 2, 1, 3].
+    //
+    // Cast dst dtype if needed (dst is typically F32; SDP scratch is F16).
+    // Build a rank-4 view of dst in PyTorch order [B, n_q, H, D]. dst is
+    // contiguous (gated by supports_op) for ne=[head_dim, n_head, n_q, n_batch],
+    // so its dense PyTorch layout is [n_batch, n_q, n_head, head_dim].
+    const size_t dst_bpe = ggml_type_size(dst->type);
+    int64_t dout_d[4] = { n_batch, n_q, n_head, head_dim };
+    int64_t dout_s[4] = { (int64_t) (dst->nb[3] / dst_bpe),
+                          (int64_t) (dst->nb[2] / dst_bpe),
+                          (int64_t) (dst->nb[1] / dst_bpe),
+                          (int64_t) (dst->nb[0] / dst_bpe) };
+
+    // Re-describe the SDP scratch in [B, n_q, n_head, head_dim] order with
+    // strides that select the same memory cells as the SDP output tensor
+    // viewed at [B, n_head, n_q, head_dim] dense layout. This is the
+    // "logical permute" view: scratch_view[b][q][h][d] == sdp_out[b][h][q][d].
+    //
+    //   sdp_out strides (B, H, Q, D contig): [n_head*n_q*head_dim, n_q*head_dim, head_dim, 1]
+    //   logical permute (0, 2, 1, 3):        [n_head*n_q*head_dim, head_dim, n_q*head_dim, 1]
+    int64_t pd[4] = { n_batch, n_q, n_head, head_dim };
+    int64_t ps[4] = { n_head * n_q * head_dim, head_dim, n_q * head_dim, 1 };
+
+    if (dst->type == GGML_TYPE_F32) {
+        // Cast F16 SDP output -> F32 in a contiguous [B, H, Q, D] scratch.
+        const size_t cast_bytes = (size_t) n_batch * n_head * n_q * head_dim * sizeof(float);
+        void * cast_buf = ctx->pool.alloc(cast_bytes);
+        topsatenTensor cast_t(topsatenSize_t(od, 4), topsatenSize_t(os, 4),
+                              TOPSATEN_DATA_FP32, cast_buf);
+        topsatenDataType_t target = TOPSATEN_DATA_FP32;
+        TOPSATEN_CHECK(topsatenTo(cast_t, sdp_out, target,
+                                  false, true,
+                                  TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
+
+        // Permute via topsatenCopy: same shape [B, n_q, n_head, head_dim]
+        // on both sides, scratch view selects [b][q][h][d] = scratch[b][h][q][d].
+        topsatenTensor scratch_perm(topsatenSize_t(pd, 4), topsatenSize_t(ps, 4),
+                                    TOPSATEN_DATA_FP32, cast_buf);
+        topsatenTensor out_t(topsatenSize_t(dout_d, 4), topsatenSize_t(dout_s, 4),
+                             TOPSATEN_DATA_FP32, dst->data);
+        TOPSATEN_CHECK(topsatenCopy(out_t, scratch_perm, /*non_blocking=*/false,
+                                    ctx->compute_stream));
+
+        gcu_release_scratch(ctx, cast_buf, cast_bytes);
+    } else {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        topsatenTensor scratch_perm(topsatenSize_t(pd, 4), topsatenSize_t(ps, 4),
+                                    TOPSATEN_DATA_FP16, out_f16);
+        topsatenTensor out_t(topsatenSize_t(dout_d, 4), topsatenSize_t(dout_s, 4),
+                             TOPSATEN_DATA_FP16, dst->data);
+        TOPSATEN_CHECK(topsatenCopy(out_t, scratch_perm, /*non_blocking=*/false,
+                                    ctx->compute_stream));
+    }
+
+    gcu_release_scratch(ctx, q_buf,   q_bytes);
+    gcu_release_scratch(ctx, k_buf,   k_bytes);
+    gcu_release_scratch(ctx, v_buf,   v_bytes);
+    gcu_release_scratch(ctx, out_f16, out_f16_bytes);
+    return true;
+}
+
 // SILU. y = x * sigmoid(x). Same dtype in/out, contiguous.
 static bool gcu_op_silu(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     ggml_tensor * src = dst->src[0];
@@ -2050,6 +2267,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_mul_mat_id(ctx, node);
         case GGML_OP_SOFT_MAX:
             return gcu_op_soft_max(ctx, node);
+        case GGML_OP_FLASH_ATTN_EXT:
+            return gcu_op_flash_attn_ext(ctx, node);
         case GGML_OP_CONCAT:
             return gcu_op_concat(ctx, node);
         case GGML_OP_NORM:
@@ -2435,6 +2654,62 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (op->src[0]->type != op->type) return false;
             if (op->src[1] && !gcu_dtype_supported(op->src[1]->type)) return false;
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // Tranche B: fused QKV softmax matmul via topsatenScaledDotProductAttention.
+            //
+            // Contract from ggml_flash_attn_ext (ggml.c):
+            //   src[0] q     [head_dim, n_q,  n_head,    n_batch]   F32 or F16
+            //   src[1] k     [head_dim, n_kv, n_head_kv, n_batch]   F16 (we gate to F16)
+            //   src[2] v     [head_dim, n_kv, n_head_kv, n_batch]   F16 (we gate to F16)
+            //   src[3] mask                                          F16 (or null)
+            //   src[4] sinks                                         not supported
+            //   op_params: f32 scale, f32 max_bias, f32 logit_softcap, i32 prec
+            const ggml_tensor * q    = op->src[0];
+            const ggml_tensor * k    = op->src[1];
+            const ggml_tensor * v    = op->src[2];
+            const ggml_tensor * mask = op->src[3];
+            const ggml_tensor * sinks = op->src[4];
+            if (!q || !k || !v) return false;
+            if (sinks) return false;                          // attention sinks: not supported
+            // dst dtype: F32 is the standard llama.cpp output; F16 also accepted.
+            if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) return false;
+            // Q dtype: F32 (post-RoPE) or F16 (rare).
+            if (q->type != GGML_TYPE_F32 && q->type != GGML_TYPE_F16) return false;
+            // K and V: F16 only — that is what llama-graph.cpp emits after the
+            // pre-FA cast (lines 1969-1975) for both kv-cache F16 and -nkvo F32 paths.
+            if (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) return false;
+            if (mask) {
+                if (mask->type != GGML_TYPE_F16) return false;
+                if (!ggml_is_contiguous(mask)) return false;  // ggml asserts this
+            }
+            // ALiBi (max_bias != 0): not supported by topsatenSDP. CPU fallback.
+            // logit_softcap != 0: Gemma-style softcap; not supported.
+            float max_bias, logit_softcap;
+            memcpy(&max_bias,      (const float *) op->op_params + 1, sizeof(float));
+            memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
+            if (max_bias      != 0.0f) return false;
+            if (logit_softcap != 0.0f) return false;
+            // Shape constraints.
+            if (q->ne[0] != k->ne[0] || q->ne[0] != v->ne[0]) return false;
+            if (k->ne[1] != v->ne[1]) return false;
+            if (k->ne[2] != v->ne[2]) return false;
+            if (k->ne[3] != q->ne[3] || v->ne[3] != q->ne[3]) return false;
+            if (q->ne[2] % k->ne[2] != 0) return false;       // GQA broadcast
+            // The handler materializes Q/K/V into PyTorch-contiguous F16
+            // scratches via topsatenTo; only the innermost dim (head_dim)
+            // must be unit-stride. dst is created by ggml as a fresh
+            // tensor and is fully contiguous. Q/K/V routinely arrive as
+            // ggml_permute(0, 2, 1, 3) views, which have non-monotone
+            // outer strides; that is fine because make_topsaten_tensor
+            // honors the raw nb[]. ggml_is_contiguous_1 would reject those
+            // views (it checks dims >= 2 are packed), so use the weaker
+            // "innermost dim is unit-stride" gate the handler actually needs.
+            if (q->nb[0] != ggml_type_size(q->type)) return false;
+            if (k->nb[0] != ggml_type_size(k->type)) return false;
+            if (v->nb[0] != ggml_type_size(v->type)) return false;
+            if (!ggml_is_contiguous(op))             return false;
             return true;
         }
         default:
