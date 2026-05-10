@@ -1590,6 +1590,504 @@ static int test_mul_mat_id_f16(ggml_backend_t gcu) {
     return 0;
 }
 
+// MUL_MAT_ID with broadcast input (b->ne[1] == 1) — the MoE FFN shape that
+// Gemma 4 exercises. Each token's input is reshaped to [n_embd, 1, n_tokens]
+// before being routed across n_expert_used experts, so the MUL_MAT_ID op
+// has b->ne[1]==1 with ids->ne[0]==n_expert_used. The (e % r) addressing
+// branch in gcu_op_mul_mat_id collapses to (e % 1)==0 for every slot,
+// so the same input row is shared across all per-token experts.
+//
+// This case was missing from the smoke set; the existing F32/F16 tests
+// use n_expert_used==r==2 which never exercises the broadcast.
+static int test_mul_mat_id_broadcast(ggml_backend_t gcu) {
+    const int64_t K = 256;
+    const int64_t M = 512;
+    const int64_t n_expert      = 8;
+    const int64_t n_expert_used = 4;
+    const int64_t n_tokens      = 4;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * as_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, M, n_expert);
+    // Broadcast: b->ne[1] == 1, ids->ne[0] == n_expert_used.
+    ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n_tokens);
+    ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+    ggml_tensor * c    = ggml_mul_mat_id(ctx, as_w, b, ids);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL_MAT_ID_BCAST: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       w_f32((size_t) K * M * n_expert);
+    std::vector<ggml_fp16_t> w_f16((size_t) K * M * n_expert);
+    std::vector<float>       h_b ((size_t) K * 1 * n_tokens);
+    std::vector<int32_t>     h_ids((size_t) n_expert_used * n_tokens);
+    std::vector<float>       h_c ((size_t) M * n_expert_used * n_tokens);
+    std::vector<float>       expected((size_t) M * n_expert_used * n_tokens);
+
+    fill_random_f32(w_f32.data(), w_f32.size(), 271);
+    fill_random_f32(h_b.data(),   h_b.size(),   272);
+    ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), w_f16.size());
+
+    // Distinct expert per (t, e) slot.
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            h_ids[t * n_expert_used + e] = (int32_t) ((t + e * 3) % n_expert);
+        }
+    }
+
+    // CPU reference: every (t, e) shares b[:, 0, t] (the "broadcast row").
+    std::vector<float> w_lossy((size_t) K * M * n_expert);
+    for (size_t i = 0; i < w_f16.size(); i++) {
+        w_lossy[i] = ggml_fp16_to_fp32(w_f16[i]);
+    }
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            const int32_t expert_id = h_ids[t * n_expert_used + e];
+            const float * w_mat = w_lossy.data() + (size_t) expert_id * M * K;
+            const float * b_vec = h_b.data()     + (size_t) t * K;        // single shared row per token
+            float       * c_vec = expected.data() + (size_t)(t * n_expert_used + e) * M;
+            for (int64_t m = 0; m < M; m++) {
+                float acc = 0.0f;
+                const float * w_row = w_mat + m * K;
+                for (int64_t k = 0; k < K; k++) acc += w_row[k] * b_vec[k];
+                c_vec[m] = acc;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(as_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(b,    h_b.data(),   0, h_b.size()   * sizeof(float));
+    ggml_backend_tensor_set(ids,  h_ids.data(), 0, h_ids.size() * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_MAT_ID_BCAST: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, h_c.data(), 0, h_c.size() * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < h_c.size(); i++) {
+        const float err = std::fabs(h_c[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(h_c[i], expected[i], 5e-2f, 1e-2f)) {
+            if (bad < 5) fprintf(stderr, "MUL_MAT_ID_BCAST: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 i, h_c[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MUL_MAT_ID_BCAST: %d mismatches over %zu (max_abs_err=%f)\n",
+                bad, h_c.size(), max_err);
+        return 1;
+    }
+    printf("MUL_MAT_ID_BCAST: ok (%zu elements, max_abs_err=%f)\n", h_c.size(), max_err);
+    return 0;
+}
+
+// Round-trip a Q-typed tensor: set_tensor(Q-quant bytes), get_tensor() must
+// return the exact same bytes. The GCU backend dequants Q-types to F16 on
+// load (MVP-3a) for the matmul fast path, so a naive memcpy in get_tensor
+// would hand back F16 bytes interpreted as Q-type — which the ggml scheduler
+// blindly trusts when it routes a downstream op (e.g. CPU MUL_MAT_ID for
+// MoE) onto a different backend. That mismatch was the Gemma 4 26B-A4B
+// failure: the model produced a single dash and whitespace because every
+// CPU-side MoE matmul saw garbage weights.
+static int test_q_weight_roundtrip(ggml_backend_t gcu, ggml_type qt, const char * label) {
+    const int64_t K = 256;
+    const int64_t M = 64;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 8 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, qt, K, M);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "%s: alloc failed\n", label); ggml_free(ctx); return 1; }
+
+    std::vector<float> w_f32_ref((size_t) K * M);
+    fill_random_f32(w_f32_ref.data(), w_f32_ref.size(), 401);
+
+    const size_t row_size = ggml_row_size(qt, K);
+    std::vector<uint8_t> w_quant_in((size_t) M * row_size);
+    const size_t actual = ggml_quantize_chunk(qt, w_f32_ref.data(), w_quant_in.data(),
+                                              0, M, K, /*imatrix=*/ nullptr);
+    if (actual != w_quant_in.size()) {
+        fprintf(stderr, "%s: quantize_chunk %zu vs %zu\n", label, actual, w_quant_in.size());
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+
+    ggml_backend_tensor_set(w, w_quant_in.data(), 0, w_quant_in.size());
+
+    std::vector<uint8_t> w_quant_out((size_t) M * row_size);
+    ggml_backend_tensor_get(w, w_quant_out.data(), 0, w_quant_out.size());
+
+    int diffs = 0;
+    for (size_t i = 0; i < w_quant_in.size(); i++) {
+        if (w_quant_in[i] != w_quant_out[i]) {
+            if (diffs < 5) fprintf(stderr, "%s: byte %zu in=%u out=%u\n",
+                                   label, i, (unsigned) w_quant_in[i], (unsigned) w_quant_out[i]);
+            diffs++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (diffs) {
+        fprintf(stderr, "%s: %d byte mismatches over %zu bytes\n",
+                label, diffs, w_quant_in.size());
+        return 1;
+    }
+    printf("%s: ok (%zu bytes)\n", label, w_quant_in.size());
+    return 0;
+}
+
+static int test_q4_0_roundtrip(ggml_backend_t gcu) { return test_q_weight_roundtrip(gcu, GGML_TYPE_Q4_0, "Q4_0_ROUNDTRIP"); }
+static int test_q8_0_roundtrip(ggml_backend_t gcu) { return test_q_weight_roundtrip(gcu, GGML_TYPE_Q8_0, "Q8_0_ROUNDTRIP"); }
+static int test_q4_k_roundtrip(ggml_backend_t gcu) { return test_q_weight_roundtrip(gcu, GGML_TYPE_Q4_K, "Q4_K_ROUNDTRIP"); }
+
+// MUL_MAT_ID with **Q4_K weights** at Gemma 4 production sizes: K=2816,
+// M=1408 (= 2 * n_ff_exp), n_expert_used=8, n_tokens=2. Exercises the
+// Q-dequant-on-load path: device receives Q4_K bytes per-expert and the
+// buffer.set_tensor dequants the whole 3D weight to F16 in one host pass
+// before upload. If the dequant scrambles row order or splits across
+// the M dimension incorrectly, the gate/up halves will be misaligned in
+// the device buffer even though MUL_MAT_ID with hand-uploaded F16 works.
+static int test_mul_mat_id_q4k_gemma4(ggml_backend_t gcu) {
+    const int64_t K = 2816;
+    const int64_t M = 2 * 704;     // 2 * n_ff_exp
+    const int64_t n_expert      = 4;
+    const int64_t n_expert_used = 8;
+    const int64_t n_tokens      = 2;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * as_w = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, K, M, n_expert);
+    ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n_tokens);
+    ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+    ggml_tensor * c    = ggml_mul_mat_id(ctx, as_w, b, ids);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL_MAT_ID_Q4K_GEMMA4: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    // F32 reference weight, then quantize (whole tensor as one chunk —
+    // ggml_quantize_chunk needs a multiple of K elements per row block).
+    std::vector<float> w_f32_ref((size_t) K * M * n_expert);
+    fill_random_f32(w_f32_ref.data(), w_f32_ref.size(), 301);
+
+    const size_t row_size_q = ggml_row_size(GGML_TYPE_Q4_K, K);
+    std::vector<uint8_t> w_quant((size_t) M * n_expert * row_size_q);
+    const size_t actual = ggml_quantize_chunk(GGML_TYPE_Q4_K, w_f32_ref.data(),
+                                              w_quant.data(), 0, M * n_expert, K, nullptr);
+    if (actual != w_quant.size()) {
+        fprintf(stderr, "MUL_MAT_ID_Q4K_GEMMA4: quantize_chunk %zu vs %zu\n", actual, w_quant.size());
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+
+    // Reference uses the lossy-dequantized weight (matches what the device sees).
+    const ggml_type_traits * tt = ggml_get_type_traits(GGML_TYPE_Q4_K);
+    std::vector<float> w_lossy((size_t) K * M * n_expert);
+    tt->to_float(w_quant.data(), w_lossy.data(), (size_t) K * M * n_expert);
+
+    std::vector<float>   h_b ((size_t) K * 1 * n_tokens);
+    std::vector<int32_t> h_ids((size_t) n_expert_used * n_tokens);
+    std::vector<float>   h_c ((size_t) M * n_expert_used * n_tokens);
+    std::vector<float>   expected((size_t) M * n_expert_used * n_tokens);
+
+    fill_random_f32(h_b.data(), h_b.size(), 302);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            h_ids[t * n_expert_used + e] = (int32_t) ((t * 3 + e) % n_expert);
+        }
+    }
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            const int32_t expert_id = h_ids[t * n_expert_used + e];
+            const float * w_mat = w_lossy.data() + (size_t) expert_id * M * K;
+            const float * b_vec = h_b.data()     + (size_t) t * K;
+            float       * c_vec = expected.data() + (size_t)(t * n_expert_used + e) * M;
+            for (int64_t m = 0; m < M; m++) {
+                float acc = 0.0f;
+                const float * w_row = w_mat + m * K;
+                for (int64_t k = 0; k < K; k++) acc += w_row[k] * b_vec[k];
+                c_vec[m] = acc;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(as_w, w_quant.data(), 0, w_quant.size());
+    ggml_backend_tensor_set(b,    h_b.data(),     0, h_b.size()   * sizeof(float));
+    ggml_backend_tensor_set(ids,  h_ids.data(),   0, h_ids.size() * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_MAT_ID_Q4K_GEMMA4: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, h_c.data(), 0, h_c.size() * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < h_c.size(); i++) {
+        const float err = std::fabs(h_c[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(h_c[i], expected[i], 5e-1f, 1e-1f)) {
+            if (bad < 5) fprintf(stderr, "MUL_MAT_ID_Q4K_GEMMA4: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 i, h_c[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MUL_MAT_ID_Q4K_GEMMA4: %d mismatches over %zu (max_abs_err=%f)\n",
+                bad, h_c.size(), max_err);
+        return 1;
+    }
+    printf("MUL_MAT_ID_Q4K_GEMMA4: ok (%zu elements, max_abs_err=%f)\n", h_c.size(), max_err);
+    return 0;
+}
+
+// MUL_MAT_ID with broadcast at Gemma 4 production sizes: K=2816, M=1408
+// (= 2 * n_ff_exp), n_expert_used=8, n_tokens=2. n_expert is shrunk from 128
+// to 4 to keep the test cheap, but the K and M used are exactly what the
+// model exercises. Detects regressions specific to the F16-accumulation
+// drift at this scale or to row-ordering inside the F16-on-device weight.
+static int test_mul_mat_id_gemma4_shape(ggml_backend_t gcu) {
+    const int64_t K = 2816;
+    const int64_t M = 2 * 704;     // 2 * n_ff_exp
+    const int64_t n_expert      = 4;
+    const int64_t n_expert_used = 8;
+    const int64_t n_tokens      = 2;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * as_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, M, n_expert);
+    ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n_tokens);
+    ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+    ggml_tensor * c    = ggml_mul_mat_id(ctx, as_w, b, ids);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MUL_MAT_ID_GEMMA4: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       w_f32((size_t) K * M * n_expert);
+    std::vector<ggml_fp16_t> w_f16((size_t) K * M * n_expert);
+    std::vector<float>       h_b ((size_t) K * 1 * n_tokens);
+    std::vector<int32_t>     h_ids((size_t) n_expert_used * n_tokens);
+    std::vector<float>       h_c ((size_t) M * n_expert_used * n_tokens);
+    std::vector<float>       expected((size_t) M * n_expert_used * n_tokens);
+
+    fill_random_f32(w_f32.data(), w_f32.size(), 291);
+    fill_random_f32(h_b.data(),   h_b.size(),   292);
+    ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), w_f16.size());
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            h_ids[t * n_expert_used + e] = (int32_t) ((t * 3 + e) % n_expert);
+        }
+    }
+
+    std::vector<float> w_lossy((size_t) K * M * n_expert);
+    for (size_t i = 0; i < w_f16.size(); i++) w_lossy[i] = ggml_fp16_to_fp32(w_f16[i]);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            const int32_t expert_id = h_ids[t * n_expert_used + e];
+            const float * w_mat = w_lossy.data() + (size_t) expert_id * M * K;
+            const float * b_vec = h_b.data()     + (size_t) t * K;
+            float       * c_vec = expected.data() + (size_t)(t * n_expert_used + e) * M;
+            for (int64_t m = 0; m < M; m++) {
+                float acc = 0.0f;
+                const float * w_row = w_mat + m * K;
+                for (int64_t k = 0; k < K; k++) acc += w_row[k] * b_vec[k];
+                c_vec[m] = acc;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(as_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(b,    h_b.data(),   0, h_b.size()   * sizeof(float));
+    ggml_backend_tensor_set(ids,  h_ids.data(), 0, h_ids.size() * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MUL_MAT_ID_GEMMA4: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, h_c.data(), 0, h_c.size() * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    // K=2816 is much larger than the K=256 used in MUL_MAT_ID_F16, so F16
+    // accumulator drift scales — relax atol/rtol accordingly.
+    for (size_t i = 0; i < h_c.size(); i++) {
+        const float err = std::fabs(h_c[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(h_c[i], expected[i], 5e-1f, 1e-1f)) {
+            if (bad < 5) fprintf(stderr, "MUL_MAT_ID_GEMMA4: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 i, h_c[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MUL_MAT_ID_GEMMA4: %d mismatches over %zu (max_abs_err=%f)\n",
+                bad, h_c.size(), max_err);
+        return 1;
+    }
+    printf("MUL_MAT_ID_GEMMA4: ok (%zu elements, max_abs_err=%f)\n", h_c.size(), max_err);
+    return 0;
+}
+
+// MoE FFN chain: MUL_MAT_ID with broadcast + GEGLU split form on a strided
+// view of the MUL_MAT_ID output. This mirrors the exact subgraph that
+// build_moe_ffn produces for Gemma 4 with the merged gate_up path:
+//
+//   gate_up = mul_mat_id(W, x_bcast, ids)        // [2*n_ff, n_used, n_tokens]
+//   gate    = view of gate_up dim-0 [0     .. n_ff)
+//   up      = view of gate_up dim-0 [n_ff .. 2*n_ff)
+//   y       = geglu_split(gate, up)              // GELU(gate) * up
+//
+// The gate / up views have ne[0]==n_ff, ne[1]==n_used, ne[2]==n_tokens but
+// their nb[1] equals the parent's nb[1] (=2*n_ff*bpe), not n_ff*bpe. So
+// this exercises GLU two-source with strided sources on top of the
+// broadcast mul_mat_id case — neither was covered by the per-op tests.
+static int test_moe_gate_up_geglu(ggml_backend_t gcu) {
+    const int64_t K = 256;
+    const int64_t n_ff = 256;
+    const int64_t n_expert      = 4;
+    const int64_t n_expert_used = 2;
+    const int64_t n_tokens      = 3;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 64 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * W   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, 2 * n_ff, n_expert);
+    ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+
+    ggml_tensor * gate_up = ggml_mul_mat_id(ctx, W, x, ids); // [2*n_ff, n_used, n_tokens]
+    // gate / up halves of dim 0 — same view trick that build_moe_ffn uses.
+    ggml_tensor * gate = ggml_view_3d(ctx, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2],
+                                      gate_up->nb[1], gate_up->nb[2], 0);
+    ggml_tensor * up   = ggml_view_3d(ctx, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2],
+                                      gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+    ggml_tensor * y = ggml_geglu_split(ctx, gate, up);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MOE_GATE_UP_GEGLU: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       w_f32((size_t) K * (2 * n_ff) * n_expert);
+    std::vector<ggml_fp16_t> w_f16((size_t) K * (2 * n_ff) * n_expert);
+    std::vector<float>       h_x ((size_t) K * 1 * n_tokens);
+    std::vector<int32_t>     h_ids((size_t) n_expert_used * n_tokens);
+    std::vector<float>       h_y ((size_t) n_ff * n_expert_used * n_tokens);
+    std::vector<float>       expected((size_t) n_ff * n_expert_used * n_tokens);
+
+    fill_random_f32(w_f32.data(), w_f32.size(), 281);
+    fill_random_f32(h_x.data(),   h_x.size(),   282);
+    ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), w_f16.size());
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            h_ids[t * n_expert_used + e] = (int32_t) ((t + e) % n_expert);
+        }
+    }
+
+    // CPU reference: dequant W, run mul_mat_id with broadcast, split & GEGLU.
+    std::vector<float> w_lossy((size_t) K * (2 * n_ff) * n_expert);
+    for (size_t i = 0; i < w_f16.size(); i++) w_lossy[i] = ggml_fp16_to_fp32(w_f16[i]);
+    std::vector<float> gu_ref((size_t) (2 * n_ff) * n_expert_used * n_tokens);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            const int32_t expert_id = h_ids[t * n_expert_used + e];
+            const float * w_mat = w_lossy.data() + (size_t) expert_id * (2 * n_ff) * K;
+            const float * b_vec = h_x.data()     + (size_t) t * K;
+            float       * out   = gu_ref.data()  + (size_t)(t * n_expert_used + e) * (2 * n_ff);
+            for (int64_t m = 0; m < 2 * n_ff; m++) {
+                float acc = 0.0f;
+                const float * w_row = w_mat + m * K;
+                for (int64_t k = 0; k < K; k++) acc += w_row[k] * b_vec[k];
+                out[m] = acc;
+            }
+        }
+    }
+    // GEGLU split: gate is the first n_ff of dim-0, up is the second n_ff.
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            const float * gu = gu_ref.data() + (size_t)(t * n_expert_used + e) * (2 * n_ff);
+            float       * yy = expected.data() + (size_t)(t * n_expert_used + e) * n_ff;
+            for (int64_t i = 0; i < n_ff; i++) {
+                const float g = gu[i];
+                const float u = gu[n_ff + i];
+                const float gelu = 0.5f * g * (1.0f + std::erf(g / std::sqrt(2.0f)));
+                yy[i] = gelu * u;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(W,   w_f16.data(),  0, w_f16.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(x,   h_x.data(),    0, h_x.size()   * sizeof(float));
+    ggml_backend_tensor_set(ids, h_ids.data(),  0, h_ids.size() * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MOE_GATE_UP_GEGLU: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(y, h_y.data(), 0, h_y.size() * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < h_y.size(); i++) {
+        const float err = std::fabs(h_y[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        // GEGLU on top of an F16-accumulated K=256 sum — wider tolerance.
+        if (!close_enough(h_y[i], expected[i], 1e-1f, 5e-2f)) {
+            if (bad < 5) fprintf(stderr, "MOE_GATE_UP_GEGLU: mismatch idx=%zu got=%f want=%f (err=%f)\n",
+                                 i, h_y[i], expected[i], err);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) {
+        fprintf(stderr, "MOE_GATE_UP_GEGLU: %d mismatches over %zu (max_abs_err=%f)\n",
+                bad, h_y.size(), max_err);
+        return 1;
+    }
+    printf("MOE_GATE_UP_GEGLU: ok (%zu elements, max_abs_err=%f)\n", h_y.size(), max_err);
+    return 0;
+}
+
 // ROPE NEOX-mode (mode=2). Splits the head dim into two halves and
 // rotates them as a pair (NeoX/Phi convention) instead of interleaved
 // pairs. Same cos/sin table; different application.
@@ -2404,6 +2902,9 @@ int main() {
     rc |= test_mul_mat_q4_0(gcu);
     rc |= test_mul_mat_q8_0(gcu);
     rc |= test_mul_mat_q4_k(gcu);
+    rc |= test_q4_0_roundtrip(gcu);
+    rc |= test_q8_0_roundtrip(gcu);
+    rc |= test_q4_k_roundtrip(gcu);
     rc |= test_silu(gcu);
     rc |= test_silu_f16(gcu);
     rc |= test_gelu(gcu);
@@ -2430,6 +2931,10 @@ int main() {
     rc |= test_mul_mat_mixed_f16in(gcu);
     rc |= test_mul_mat_id(gcu);
     rc |= test_mul_mat_id_f16(gcu);
+    rc |= test_mul_mat_id_broadcast(gcu);
+    rc |= test_mul_mat_id_gemma4_shape(gcu);
+    rc |= test_mul_mat_id_q4k_gemma4(gcu);
+    rc |= test_moe_gate_up_geglu(gcu);
     rc |= test_async_overlap(gcu);
 
     const bool bench_ran = (rc == 0 && getenv("GCU_BENCH") != nullptr);
