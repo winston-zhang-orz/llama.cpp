@@ -680,6 +680,15 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 
   This is the first MoE workload to validate against the new `MUL_MAT_ID` op and the queued-ops path together. The tg uplift (+25%) is meaningful: the per-token compute amortizes launch overhead more than a pure dense decode would, so the MVP-4b benefit is bounded but real. pp64 difference is within the stddev band (single run pair); a longer r=5 sweep would tighten the prefill comparison.
 
+  After Tranche B+D+F+H op-coverage work (FLASH_ATTN_EXT, GLU, the MoE weight-norm path moved to GCU, etc., HEAD `a45036658`, r=5):
+
+  | test  | t/s                  |
+  |-------|----------------------|
+  | tg16  | 13.97 ± 0.16         |
+  | pp64  | 34.51 ± 1.63         |
+
+  tg16 is **+82.6 %** vs the pre-MVP-5 baseline (7.65 → 13.97 t/s). Driving factors: `FLASH_ATTN_EXT` collapses Q@K + scaled softmax + @V into one fused kernel per attention layer; `SUM_ROWS` / `MEAN` / `DIV` / `CLAMP` for MoE weight normalization moved from CPU fallback to GCU, eliminating cross-backend round-trips per layer; `GLU` keeps the FFN gate*up step on-device.
+
   **Honest read of MVP-4b's payoff.** The token-generation uplift is large and real: +19–21 % on Llama 1B Q4_K_M, +54–61 % on Qwen 0.5B F16, and +25 % on Gemma 4 26B A4B — well outside session-to-session noise in all three. This directly confirms that per-op `topsStreamSynchronize` host round-trips were the dominant tg bottleneck, not compute throughput itself. Prefill (pp512) gains are smaller (+4 % / +2 %) because its runtime is dominated by matrix multiply kernel time, not host-side dispatch overhead; the relative overhead of a per-op sync is diluted over longer per-op GPU work. The Qwen F16 tg uplift is larger than Llama Q4_K_M's because F16 decode ops are individually cheaper (less compute per op) so the fixed host-roundtrip cost is a larger fraction of total time. In practice MVP-4b brings GCU tg throughput from the ~28–34 t/s range (CPU-synchronized level) to the ~34–43 t/s range — a meaningful step, though absolute throughput is still gated by the S60's per-kernel launch latency at this scale.
 
 ### Known SDK ceilings (per-topsaten investigation)
