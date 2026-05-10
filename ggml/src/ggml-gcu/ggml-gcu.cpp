@@ -282,6 +282,27 @@ struct ggml_backend_gcu_buffer_context {
     ggml_backend_gcu_context * ctx;
     void *  base;
     size_t  size;
+
+    // MVP-3a layout-mismatch shim. Q-typed weight tensors are stored as F16
+    // on the device (dequant-on-load) but their ggml type and `nb[]` still
+    // describe the Q packing. When the scheduler asks for a CPU-side copy of
+    // such a tensor (for ops it places on the CPU backend), the canonical
+    // path goes through the buffer's get_tensor, which expects exactly
+    // ggml_nbytes(t) bytes in the original Q layout — F16 bytes lie about
+    // their layout so a naive memcpy hands the CPU side garbage. Re-running
+    // a Q-quant on the F16 (per cross-backend copy) is correct but in
+    // practice ~1 GiB of host-side compute per matmul fallback, which makes
+    // a 25B MoE unusable.
+    //
+    // Workaround: stash a host-side copy of the original Q-quant bytes at
+    // load time (set_tensor), keyed by the device-side tensor->data pointer.
+    // get_tensor for Q-typed tensors hands the cached bytes back. Memory
+    // overhead is the size of the Q-quant model on host (~16 GB for the
+    // Q4_K_M target). The CPU-side mmap of the gguf file already has these
+    // bytes resident in page cache, but we cannot rely on the loader's
+    // source pointer outliving set_tensor (the read path uses a reusable
+    // scratch buffer), so we copy.
+    std::unordered_map<const void *, std::vector<uint8_t>> q_host_cache;
 };
 
 static void ggml_backend_gcu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -337,6 +358,12 @@ static void ggml_backend_gcu_buffer_set_tensor(ggml_backend_buffer_t buffer,
         TOPS_CHECK(topsMemcpy(tensor->data, host_f16.data(),
                               (size_t) n_elem * sizeof(ggml_fp16_t),
                               topsMemcpyHostToDevice));
+
+        // Stash the original Q-quant bytes for later get_tensor / cross-
+        // backend copy requests. See the q_host_cache comment in the buffer
+        // context for the why.
+        auto & cache = bctx->q_host_cache[tensor->data];
+        cache.assign((const uint8_t *) data, (const uint8_t *) data + size);
         return;
 
     }
@@ -349,6 +376,30 @@ static void ggml_backend_gcu_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                void * data, size_t offset, size_t size) {
     auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
     TOPS_CHECK(topsSetDevice(bctx->ctx->device));
+
+    // MVP-3a layout mismatch: Q-typed tensors are stored as F16 on the
+    // device (dequant-on-load) but their ggml type and `nb[]` still
+    // describe the Q packing. A naive memcpy would hand back F16 bytes
+    // interpreted as Q-type and downstream consumers (CPU MUL_MAT_ID
+    // fallback for MoE routing, eval-callback dump callbacks) would see
+    // garbage. This was the Gemma 4 26B-A4B failure mode: argsort + per-
+    // expert get_rows force some MUL_MAT_ID nodes onto CPU, the scheduler
+    // synchronously copies the Q4_K weight via this get_tensor, and the
+    // F16-bytes-under-Q4_K-type bait yielded garbage logits.
+    //
+    // Fix: hand back the original Q-quant bytes that set_tensor stashed
+    // in the per-buffer host cache. Memory cost is the Q-quant model size
+    // on host; in exchange the cross-backend copy is a plain memcpy and
+    // we do not lose precision through a Q→F16→F32→Q round-trip.
+    if (gcu_q_supported(tensor->type)) {
+        auto it = bctx->q_host_cache.find(tensor->data);
+        GGML_ASSERT(it != bctx->q_host_cache.end() &&
+                    "GCU buffer.get_tensor: missing Q-quant host cache entry");
+        GGML_ASSERT(offset + size <= it->second.size());
+        memcpy(data, it->second.data() + offset, size);
+        return;
+    }
+
     TOPS_CHECK(topsMemcpy(data, (const char *) tensor->data + offset, size, topsMemcpyDeviceToHost));
 }
 
@@ -357,7 +408,20 @@ static bool ggml_backend_gcu_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     if (!ggml_backend_buffer_is_host(src->buffer) && src->buffer->buft == dst->buffer->buft) {
         auto * bctx = (ggml_backend_gcu_buffer_context *) buffer->context;
         TOPS_CHECK(topsSetDevice(bctx->ctx->device));
-        TOPS_CHECK(topsMemcpy(dst->data, src->data, ggml_nbytes(src), topsMemcpyDeviceToDevice));
+        // Q-typed tensors are stored as F16 on the device (dequant-on-load).
+        // ggml_nbytes(src) returns the Q-quant size, but the F16 backing
+        // store is larger; copy the actual F16 byte count and replicate
+        // the host-side Q-quant cache for the destination.
+        size_t nbytes = ggml_nbytes(src);
+        if (gcu_q_supported(src->type)) {
+            nbytes = (size_t) ggml_nelements(src) * sizeof(uint16_t);
+            auto * dbctx = (ggml_backend_gcu_buffer_context *) dst->buffer->context;
+            auto it = bctx->q_host_cache.find(src->data);
+            if (it != bctx->q_host_cache.end()) {
+                dbctx->q_host_cache[dst->data] = it->second;
+            }
+        }
+        TOPS_CHECK(topsMemcpy(dst->data, src->data, nbytes, topsMemcpyDeviceToDevice));
         return true;
     }
     return false;
