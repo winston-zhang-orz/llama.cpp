@@ -2034,16 +2034,23 @@ static bool gcu_op_get_rows(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 // convention: row p contains cos values for theta_i*p in the first n_dims/2
 // slots followed by sin values in the next n_dims/2 slots.
 //
-// theta_i = freq_base^(-2i / n_dims) * freq_scale
+// theta_i = freq_base^(-2i / n_dims) * freq_scale / freq_factors[i]
+//
+// `freq_factors` may be NULL (no per-frequency scaling, behaves as 1.0).
+// When non-NULL it must point to at least `n_dims/2` floats; the per-pair
+// theta is divided by `freq_factors[i]` for pair index i. This matches
+// the CPU reference's `theta/ff` in `ggml_rope_cache_init` (ops.cpp).
 static void gcu_build_rope_cos_sin_host(int n_dims, int max_pos,
                                         float freq_base, float freq_scale,
+                                        const float * freq_factors,
                                         std::vector<float> & out) {
     const int half = n_dims / 2;
     out.assign((size_t) max_pos * (size_t) n_dims, 0.0f);
     for (int p = 0; p < max_pos; p++) {
         float * row = out.data() + (size_t) p * n_dims;
         for (int i = 0; i < half; i++) {
-            const float theta = std::pow(freq_base, -2.0f * (float) i / (float) n_dims) * freq_scale;
+            const float ff    = freq_factors ? freq_factors[i] : 1.0f;
+            const float theta = std::pow(freq_base, -2.0f * (float) i / (float) n_dims) * freq_scale / ff;
             const float angle = (float) p * theta;
             row[i]        = std::cos(angle);
             row[i + half] = std::sin(angle);
@@ -2051,10 +2058,17 @@ static void gcu_build_rope_cos_sin_host(int n_dims, int max_pos,
     }
 }
 
-// ROPE. NORMAL (mode 0) and NEOX (mode bit 1) supported. YARN, MROPE,
-// VISION, IMROPE go to CPU.
+// ROPE. Supports NORMAL (mode 0), NEOX (mode 2), and `freq_factors`
+// (op->src[2] — proportional rope, used by Gemma 4 full attention and
+// other YARN-style models).
+// YARN's full theta-mixing path (ext_factor != 0) and multi-axis modes
+// (MROPE/VISION/IMROPE) still fall back to CPU; partial rotation is
+// already correctness-tested under MVP-5b/2 and multi-axis is tracked in
+// MVP-5b/3-4.
 //
-// Inputs: x [head_dim, n_heads, n_tokens, 1] F32/F16; pos [n_tokens] I32.
+// Inputs: x [head_dim, n_heads, n_tokens, 1] F32/F16/BF16;
+//         pos [n_tokens] I32;
+//         freq_factors [n_dims/2]  optional F32.
 // Maps to topsvllmRotaryEmbedding(query, key, positions, cos_sin_cache,
 //   head_size, is_neox, stream). is_neox=true rotates split halves
 // (NeoX/Phi style) instead of interleaved pairs.
@@ -2065,8 +2079,9 @@ static void gcu_build_rope_cos_sin_host(int n_dims, int max_pos,
 //
 // In-place: ggml_rope returns a view of `a`, so dst->data == x->data already.
 static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
-    ggml_tensor * x   = dst->src[0];
-    ggml_tensor * pos = dst->src[1];
+    ggml_tensor * x        = dst->src[0];
+    ggml_tensor * pos      = dst->src[1];
+    ggml_tensor * src_freq = dst->src[2];   // freq_factors (may be NULL)
 
     const int32_t n_dims = ((const int32_t *) dst->op_params)[1];
     const int32_t mode   = ((const int32_t *) dst->op_params)[2];
@@ -2082,17 +2097,33 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     GGML_ASSERT(pos->ne[0] == n_tokens);
 
     // Read positions to host so we can determine max_pos and cast to I64.
-    std::vector<int32_t> pos_host(n_tokens);
+    const int64_t pos_count = n_tokens;
+    std::vector<int32_t> pos_host(pos_count);
     TOPS_CHECK(topsMemcpy(pos_host.data(), pos->data,
-                          (size_t) n_tokens * sizeof(int32_t),
+                          (size_t) pos_count * sizeof(int32_t),
                           topsMemcpyDeviceToHost));
 
     int max_pos = 0;
     for (int32_t p : pos_host) max_pos = std::max(max_pos, (int) p);
     max_pos += 1;
 
+    // Pull freq_factors to host if present; the host-side cos/sin builder
+    // applies the per-pair scale.
+    std::vector<float> ff_host;
+    const float *      ff_ptr = nullptr;
+    if (src_freq) {
+        GGML_ASSERT(src_freq->type == GGML_TYPE_F32);
+        const int64_t ff_n = src_freq->ne[0];
+        GGML_ASSERT(ff_n >= n_dims / 2);
+        ff_host.resize(ff_n);
+        TOPS_CHECK(topsMemcpy(ff_host.data(), src_freq->data,
+                              (size_t) ff_n * sizeof(float),
+                              topsMemcpyDeviceToHost));
+        ff_ptr = ff_host.data();
+    }
+
     std::vector<float> cs_host;
-    gcu_build_rope_cos_sin_host(n_dims, max_pos, freq_base, freq_scale, cs_host);
+    gcu_build_rope_cos_sin_host(n_dims, max_pos, freq_base, freq_scale, ff_ptr, cs_host);
 
     // The SDK requires cos_sin_cache.dtype == query.dtype on this arch
     // (see op_vllm_rotary_embedding.h:188 — the FP32-cs override only
@@ -2104,7 +2135,7 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     const bool   cs_is_low  = cs_is_f16 || cs_is_bf16;
     const size_t cs_bpe     = cs_is_low ? sizeof(uint16_t) : sizeof(float);
     const size_t cs_bytes   = cs_host.size() * cs_bpe;
-    const size_t pos_bytes  = (size_t) n_tokens * sizeof(int64_t);
+    const size_t pos_bytes  = (size_t) pos_count * sizeof(int64_t);
     void * cs_dev  = ctx->pool.alloc(cs_bytes);
     void * pos_dev = ctx->pool.alloc(pos_bytes);
 
@@ -2129,8 +2160,8 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
         TOPS_CHECK(topsMemcpyAsync(cs_dev, cs_host.data(), cs_bytes,
                                    topsMemcpyHostToDevice, ctx->compute_stream));
     }
-    std::vector<int64_t> pos_i64(n_tokens);
-    for (int64_t i = 0; i < n_tokens; i++) pos_i64[i] = (int64_t) pos_host[i];
+    std::vector<int64_t> pos_i64(pos_count);
+    for (int64_t i = 0; i < pos_count; i++) pos_i64[i] = (int64_t) pos_host[i];
     TOPS_CHECK(topsMemcpyAsync(pos_dev, pos_i64.data(), pos_bytes,
                                topsMemcpyHostToDevice, ctx->compute_stream));
     // Synchronize before the kernel: the H->D copies above use std::vector
@@ -2165,7 +2196,7 @@ static bool gcu_op_rope(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     topsatenTensor k_tt(topsatenSize_t(k_d, 2), topsatenSize_t(k_s, 2),
                         ggml_to_topsaten_dtype(x->type), dummy_key_dev);
 
-    int64_t pos_d[1] = { n_tokens };
+    int64_t pos_d[1] = { pos_count };
     int64_t pos_s[1] = { 1 };
     topsatenTensor pos_tt(topsatenSize_t(pos_d, 1), topsatenSize_t(pos_s, 1),
                           TOPSATEN_DATA_I64, pos_dev);
@@ -3504,9 +3535,9 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
         // them to CPU, which is correct (their CPU forwards are fast
         // enough at the small shapes these ops use).
         case GGML_OP_ROPE: {
-            // MVP-3c: F32 + F16 supported. F16 builds the cos/sin table in
-            // F16 to satisfy the SDK's same-dtype requirement
-            // (op_vllm_rotary_embedding.h:188).
+            // MVP-3c (NORMAL+NEOX), MVP-5a (F16/BF16 cs), MVP-5b/1
+            // (freq_factors). Partial rotation, MROPE / VISION / IMROPE
+            // planned for MVP-5b/2-4.
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
             if (!op->src[1] || op->src[1]->type != GGML_TYPE_I32) return false;
@@ -3514,14 +3545,21 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             float ext_factor, attn_factor;
             memcpy(&ext_factor,  (const int32_t *) op->op_params + 7, sizeof(float));
             memcpy(&attn_factor, (const int32_t *) op->op_params + 8, sizeof(float));
-            // NORMAL (0) and NEOX (bit 1) supported. MROPE / VISION /
-            // IMROPE / YARN not supported — drop to CPU.
+            // NORMAL (0) and NEOX (2) supported; multi-axis modes still
+            // route to CPU until MVP-5b/3-4 lands the per-axis dispatch.
             if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) return false;
+            // YARN's full theta-mixing path stays on CPU; freq_factors-only
+            // (Gemma 4 / GPT-OSS proportional rope) is supported via the
+            // host-side cos/sin builder.
             if (ext_factor != 0.0f) return false;
             if (attn_factor != 0.0f && attn_factor != 1.0f) return false;
-            if (op->src[2]) return false;            // freq factors (yarn) not supported
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
             if (op->src[0]->ne[3] != 1) return false;
+            // freq_factors must be a contiguous F32 vector if present.
+            if (op->src[2]) {
+                if (op->src[2]->type != GGML_TYPE_F32) return false;
+                if (!ggml_is_contiguous(op->src[2])) return false;
+            }
             return true;
         }
         case GGML_OP_SOFT_MAX: {

@@ -4023,6 +4023,85 @@ static int test_rope_bf16(ggml_backend_t gcu) {
     return 0;
 }
 
+// MVP-5b/1: ROPE NORMAL with `freq_factors` (op->src[2]). Each pair index i
+// has its theta divided by freq_factors[i]. This is the proportional-rope
+// path Gemma 4 / GPT-OSS / YARN-without-extrapolation use; previously the
+// gate rejected freq_factors so these layers fell back to CPU.
+static int test_rope_freq_factors(ggml_backend_t gcu) {
+    const int64_t head_dim = 64, n_heads = 8, n_tokens = 16;
+    const int     n_dims = (int) head_dim;
+    const float   freq_base = 10000.0f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, n_tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * ff  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_dims / 2);
+    ggml_tensor * c   = ggml_rope_ext(ctx, a, pos, ff, n_dims, GGML_ROPE_TYPE_NORMAL,
+                                      /*n_ctx_orig=*/0, freq_base, /*freq_scale=*/1.0f,
+                                      /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
+                                      /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ROPE_FREQ_FACTORS: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    const size_t n = (size_t) head_dim * n_heads * n_tokens;
+    std::vector<float>   ha(n), hc(n), expected(n), hff(n_dims / 2);
+    std::vector<int32_t> hp(n_tokens);
+    fill_random_f32(ha.data(), n, 1409);
+    for (int64_t t = 0; t < n_tokens; t++) hp[t] = (int32_t) t;
+    // Realistic-ish factors: per-pair scale around 1.0 with some variance.
+    for (int i = 0; i < n_dims / 2; i++) hff[i] = 1.0f + 0.1f * (float)((i % 5) - 2);
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        const int p_idx = hp[t];
+        for (int64_t h = 0; h < n_heads; h++) {
+            const float * xrow = ha.data()       + (t * n_heads + h) * head_dim;
+            float       * yrow = expected.data() + (t * n_heads + h) * head_dim;
+            for (int i = 0; i < n_dims; i += 2) {
+                const float ff_i  = hff[i / 2];
+                const float theta = std::pow(freq_base, -((float) i) / (float) n_dims) / ff_i;
+                const float angle = (float) p_idx * theta;
+                const float c1 = std::cos(angle), s1 = std::sin(angle);
+                const float x0 = xrow[i];
+                const float x1 = xrow[i + 1];
+                yrow[i]     = x0 * c1 - x1 * s1;
+                yrow[i + 1] = x0 * s1 + x1 * c1;
+            }
+            for (int i = n_dims; i < head_dim; i++) yrow[i] = xrow[i];
+        }
+    }
+
+    ggml_backend_tensor_set(a,   ha.data(),  0, n * sizeof(float));
+    ggml_backend_tensor_set(pos, hp.data(),  0, n_tokens * sizeof(int32_t));
+    ggml_backend_tensor_set(ff,  hff.data(), 0, (n_dims / 2) * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ROPE_FREQ_FACTORS: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 1e-3f, 1e-3f)) {
+            if (bad < 5) fprintf(stderr, "ROPE_FREQ_FACTORS: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ROPE_FREQ_FACTORS: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("ROPE_FREQ_FACTORS: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
 // MVP-5a/5: full BF16 MUL_MAT path (BF16 weight × BF16 input → F32 output).
 // Mirrors test_mul_mat_mixed_f16in: same K/M/N (1024/2048/1024), F32
 // reference accumulator over BF16-rounded values.
@@ -5343,6 +5422,9 @@ int main() {
     rc |= test_norm_bf16(gcu);
     rc |= test_softmax_bf16(gcu);
     rc |= test_rope_bf16(gcu);
+    // MVP-5b: extended ROPE mode coverage. Each test exercises one new
+    // capability layered on top of the NORMAL/NEOX baseline above.
+    rc |= test_rope_freq_factors(gcu);   // 5b/1: proportional rope (Gemma 4 / GPT-OSS / YARN-no-extrap)
     rc |= test_mul_mat_bf16(gcu);
     rc |= test_mul_mat_mixed_bf16w(gcu);
     rc |= test_mul_mat_id_bf16(gcu);
