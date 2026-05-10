@@ -177,3 +177,16 @@ struct ggml_backend_gcu_context {
 // GGML_GCU_NO_QUEUED_OPS=1, in which case it restores the pre-MVP-4b
 // behavior (synchronize then immediate free).
 void gcu_release_scratch(ggml_backend_gcu_context * ctx, void * p, size_t sz);
+
+// === Per-context shared scratch =====================================
+//
+// Two grow-on-demand scratch buffers shared across multiple op handlers:
+// * a zero-filled F32 bias used by topsatenLinear's mandatory bias arg
+//   (matmul / matmul-id, and the LayerNorm beta in NORM / GROUP_NORM)
+// * an F32 ones buffer used as the gamma weight for RmsNorm / LayerNorm.
+//
+// Both live on ctx and follow the same release path as scratch: caller
+// does not free; ctx dtor reclaims the final allocation.
+
+void * gcu_get_zero_bias(ggml_backend_gcu_context * ctx, size_t n_bytes);
+void * gcu_get_ones_f32 (ggml_backend_gcu_context * ctx, int64_t count);

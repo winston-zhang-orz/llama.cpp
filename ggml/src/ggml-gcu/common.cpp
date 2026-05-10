@@ -208,3 +208,41 @@ void gcu_release_scratch(ggml_backend_gcu_context * ctx, void * p, size_t sz) {
         ctx->defer_free(p, sz);
     }
 }
+
+// === Per-context shared scratch =====================================
+
+// Returns a device pointer to at least n_bytes of zero memory. Grows the
+// per-context zero buffer on demand. Assumes single-stream serialization
+// so no extra synchronization is needed between resize and use.
+void * gcu_get_zero_bias(ggml_backend_gcu_context * ctx, size_t n_bytes) {
+    if (ctx->zero_bias_bytes < n_bytes) {
+        gcu_release_scratch(ctx, ctx->zero_bias, ctx->zero_bias_bytes);
+        ctx->zero_bias       = ctx->pool.alloc(n_bytes);
+        ctx->zero_bias_bytes = n_bytes;
+        TOPS_CHECK(topsMemsetAsync(ctx->zero_bias, 0, n_bytes, ctx->compute_stream));
+    }
+    return ctx->zero_bias;
+}
+
+// Returns a device pointer to a F32 ones buffer of at least `count` elements.
+// Grows on demand. Always F32; callers cast to other dtypes via topsatenTo.
+void * gcu_get_ones_f32(ggml_backend_gcu_context * ctx, int64_t count) {
+    if (ctx->ones_n0_count >= count) return ctx->ones_n0;
+    gcu_release_scratch(ctx, ctx->ones_n0, ctx->ones_n0_bytes);
+    const size_t bytes = (size_t) count * sizeof(float);
+    ctx->ones_n0       = ctx->pool.alloc(bytes);
+    ctx->ones_n0_bytes = bytes;
+    ctx->ones_n0_count = count;
+
+    // Materialize ones: zero the buffer, then add scalar 1.0 broadcast.
+    TOPS_CHECK(topsMemsetAsync(ctx->ones_n0, 0, bytes, ctx->compute_stream));
+    int64_t dims[1] = { count };
+    int64_t strs[1] = { 1 };
+    topsatenTensor t(topsatenSize_t(dims, 1), topsatenSize_t(strs, 1),
+                     TOPSATEN_DATA_FP32, ctx->ones_n0);
+    topsatenScalar_t one_lhs; one_lhs.dtype = TOPSATEN_DATA_FP32; one_lhs.fval = 1.0;
+    topsatenScalar_t alpha;   alpha.dtype   = TOPSATEN_DATA_FP32; alpha.fval   = 1.0;
+    // t = 1.0 + 1.0 * t (where t is currently 0) → t becomes 1.0
+    TOPSATEN_CHECK(topsatenAdd(t, one_lhs, t, alpha, ctx->compute_stream));
+    return ctx->ones_n0;
+}
