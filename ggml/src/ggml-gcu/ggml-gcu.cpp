@@ -2573,15 +2573,57 @@ static bool gcu_op_sum(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
-// SUM_ROWS / MEAN: reduce ggml's innermost dim (ne[0]) with keepdim. We
-// implement these by using topsatenSum/Mean's "reduce-all-elements"
-// overload on a per-row basis is too expensive; the dim-list overload
-// instead requires careful descriptor handling. Smoke tests of various
-// shape variants pass, but the canary Gemma 4 26B A4B segfaults inside
-// topsatenSum at runtime even with simple [n_expert_used, n_tokens]
-// inputs. Until that is rooted out, gate SUM_ROWS / MEAN out at
-// supports_op so the scheduler keeps them on CPU. Gemma 4's only
-// SUM_ROWS use site is the MoE weight normalization (CPU-fast).
+// SUM_ROWS / MEAN: reduce ggml's innermost dim (ne[0]) with keepdim.
+//
+// ggml stores tensors slowest-last (PyTorch reversed). make_topsaten_tensor
+// flips ne[]/nb[] back to slowest-first PyTorch order using rank =
+// ggml_n_dims(t), which strips trailing 1's. So a ggml ne={8,21,1,1}
+// shape arrives at topsaten as a rank-2 tensor [21, 8]; reducing ggml's
+// innermost dim is reducing topsaten's last dim (rank-1).
+//
+// Output ggml shape is keepdim — for ne={8,21,1,1} input, ggml_sum_rows
+// builds output ne={1,21,1,1}. ggml_n_dims of that is 2 (ne[1]=21 is the
+// last >1 dim), so the output topsaten descriptor is also rank-2 [21,1].
+// dims_in stays consistent across smoke ([4096,64] -> reduce dim 1) and
+// the real Gemma 4 prefill shape ([8,21] -> reduce dim 1). We use the
+// dim-list overload because topsatenSum has no single-int-dim overload
+// (only Mean does).
+
+static bool gcu_op_sum_rows(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+
+    gcu_tensor_dims din, dout;
+    topsatenTensor in_t  = make_topsaten_tensor(src, din);
+    topsatenTensor out_t = make_topsaten_tensor(dst, dout);
+
+    int rank = ggml_n_dims(src); if (rank < 1) rank = 1;
+    int64_t dim_arr[1] = { (int64_t) (rank - 1) };  // PyTorch last dim == ggml ne[0]
+    topsatenSize_t dims(dim_arr, 1);
+
+    TOPSATEN_CHECK(topsatenSum(out_t, in_t, dims, /*keepdims=*/true,
+                               TOPSATEN_DATA_FP32, ctx->compute_stream));
+    return true;
+}
+
+static bool gcu_op_mean(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+
+    gcu_tensor_dims din, dout;
+    topsatenTensor in_t  = make_topsaten_tensor(src, din);
+    topsatenTensor out_t = make_topsaten_tensor(dst, dout);
+
+    int rank = ggml_n_dims(src); if (rank < 1) rank = 1;
+    // Mean has a single-int-dim overload; prefer it (one less indirection
+    // than the dim-list path).
+    int32_t dim = (int32_t) (rank - 1);  // PyTorch last dim == ggml ne[0]
+    TOPSATEN_CHECK(topsatenMean(out_t, in_t, dim, /*keepdims=*/true,
+                                TOPSATEN_DATA_FP32, ctx->compute_stream));
+    return true;
+}
 
 // Tranche D5: CUMSUM. F32 only (matches ggml's CPU forward). Reduces
 // along ggml's innermost dim (ne[0]); output has same shape as input.
@@ -2844,6 +2886,10 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_cos(ctx, node);
         case GGML_OP_SUM:
             return gcu_op_sum(ctx, node);
+        case GGML_OP_SUM_ROWS:
+            return gcu_op_sum_rows(ctx, node);
+        case GGML_OP_MEAN:
+            return gcu_op_mean(ctx, node);
         case GGML_OP_CLAMP:
             return gcu_op_clamp(ctx, node);
         case GGML_OP_CUMSUM:
@@ -3274,15 +3320,12 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
             return true;
         }
-        case GGML_OP_SUM: {
-            // SUM (full reduction → scalar). F32 only. CPU forward is
-            // F32/F16/BF16 — we match the F32 fast-path; F16/BF16 stay on
-            // CPU. SUM_ROWS / MEAN are also dim-reductions but the dim-list
-            // overload of topsatenSum/Mean segfaults inside the SDK on
-            // real-model shapes (Gemma 4 26B A4B [n_expert_used,
-            // n_tokens]); their handlers were removed and the ops fall
-            // back to CPU. Revisit when we have a way to bisect inside
-            // the SDK kernel.
+        case GGML_OP_SUM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_MEAN: {
+            // F32 only. CPU forward also accepts F16/BF16 for SUM but the
+            // dim-reduce path (SUM_ROWS / MEAN) is F32-only on CPU; we
+            // keep all three on the F32 fast-path for simplicity.
             const ggml_tensor * src = op->src[0];
             if (!src) return false;
             if (src->type != GGML_TYPE_F32) return false;

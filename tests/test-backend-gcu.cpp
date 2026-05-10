@@ -1666,7 +1666,6 @@ static int test_sum(ggml_backend_t gcu) {
     return 0;
 }
 
-#if 0  // SUM_ROWS / MEAN handlers gated out (SDK segfault on Gemma 4 shapes).
 // Decode-shape MoE weight normalization: src is [n_expert_used, n_tokens]
 // where n_tokens=1 at decode. Stresses the rank-1-reduction path that
 // the prefill-shape smoke doesn't exercise.
@@ -1811,7 +1810,60 @@ static int test_mean(ggml_backend_t gcu) {
     printf("MEAN: ok (%d rows of %d elems)\n", (int) N, (int) M);
     return 0;
 }
-#endif  // SUM_ROWS / MEAN gated out
+
+// Tranche D4: SUM_ROWS at Gemma 4 26B A4B's actual prefill shape.
+// MoE weight normalization runs ggml_sum_rows on a [n_expert_used,
+// n_tokens] tensor. With 8 experts used and a 21-token prefill (the
+// shape that historically segfaulted inside the SDK), exercise this
+// shape explicitly. Output ggml ne is {1, 21, 1, 1}; both the input
+// and output strip down to rank-2 PyTorch shapes via ggml_n_dims, so
+// the topsaten descriptor passed in is rank-2 [21, 8] -> [21, 1].
+static int test_sum_rows_gemma4_prefill(ggml_backend_t gcu) {
+    const int64_t n_expert_used = 8, n_tokens = 21;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert_used, n_tokens);
+    ggml_tensor * c = ggml_sum_rows(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "SUM_ROWS_GEMMA4: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n_expert_used * n_tokens), hc(n_tokens), expected(n_tokens);
+    fill_random_f32(ha.data(), ha.size(), 75);
+    for (int64_t r = 0; r < n_tokens; r++) {
+        double s = 0.0;
+        for (int64_t k = 0; k < n_expert_used; k++) s += ha[r * n_expert_used + k];
+        expected[r] = (float) s;
+    }
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "SUM_ROWS_GEMMA4: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n_tokens * sizeof(float));
+
+    int bad = 0;
+    for (int64_t r = 0; r < n_tokens; r++) {
+        if (!close_enough(hc[r], expected[r], 1e-5f, 1e-4f)) {
+            if (bad < 5) fprintf(stderr, "SUM_ROWS_GEMMA4: r=%lld got=%f want=%f\n",
+                                 (long long) r, hc[r], expected[r]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "SUM_ROWS_GEMMA4: %d mismatches\n", bad); return 1; }
+    printf("SUM_ROWS_GEMMA4: ok (n_expert_used=%lld, n_tokens=%lld)\n",
+           (long long) n_expert_used, (long long) n_tokens);
+    return 0;
+}
 
 // Tranche D5: CUMSUM. Cumulative sum along innermost dim. F32 only.
 static int test_cumsum(ggml_backend_t gcu) {
@@ -4257,6 +4309,10 @@ int main() {
     rc |= test_div_moe_decode(gcu);
     rc |= test_add1(gcu);
     rc |= test_sum(gcu);
+    rc |= test_sum_rows(gcu);
+    rc |= test_sum_rows_moe_decode(gcu);
+    rc |= test_sum_rows_gemma4_prefill(gcu);
+    rc |= test_mean(gcu);
     rc |= test_clamp(gcu);
     rc |= test_cumsum(gcu);
     rc |= test_scale(gcu);
