@@ -611,14 +611,14 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 - Normalization: `NORM` (LayerNorm without affine), `RMS_NORM`
 - Position encoding: `ROPE` (NORMAL mode 0 + NEOX mode 2; no YARN, no MROPE/VISION/IMROPE; F32 and F16)
 - Reduction: `SOFT_MAX` (with optional mask, `max_bias = 0`, no softmax sinks)
-- Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast; Q4_0 / Q8_0 / Q4_K weights via F16 dequant-on-load)
+- Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast; Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K / Q3_K weights via F16 dequant-on-load)
 - MoE dispatch: `MUL_MAT_ID` (same dtype matrix as `MUL_MAT`; per-(token, expert-slot) `topsatenLinear` loop; F16-weight path casts F32 input once for the whole sweep). Required for Gemma 4 26B A4B and other MoE models.
 - Indexing: `GET_ROWS` (F32 only, unbatched), `SET_ROWS` (F32 dst only — KV cache stays on CPU)
 - Memory: `CPY`/`DUP`/`CONT` (same-dtype contiguous + F32↔F16 conversion); view ops (`RESHAPE`, `VIEW`, `PERMUTE`, `TRANSPOSE`)
 
 ### Known limitations (MVP-2)
 
-- Q4_0, Q8_0, and Q4_K weight tensors are dequantized to F16 at model-load time (one-time host cost) and stored as F16 on GCU (2-4× the on-disk size). MUL_MAT then runs on GCU via the F16 path. Other Q-types (Q5_K, Q6_K, Q3_K, etc.) stay on CPU. Native quantized matmul via `topsatenLinearQuant` is a future MVP that would avoid the F16 expansion and likely match Q4 CPU performance.
+- Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, and Q3_K weight tensors are dequantized to F16 at model-load time (one-time host cost) and stored as F16 on GCU (2-5× the on-disk size). MUL_MAT then runs on GCU via the F16 path. Other Q-types (Q2_K, Q5_0, Q5_1, IQ*, etc.) stay on CPU. Native quantized matmul via `topsatenLinearQuant` is a future MVP that would avoid the F16 expansion and likely match Q4 CPU performance.
 - KV cache is designed to stay on CPU. `SET_ROWS` to F16 destinations (the cache dtype) is refused on GCU. Pass `-nkvo` (`--no-kv-offload`) when offloading layers to GCU; without it llama.cpp tries to allocate the cache on GCU and the scheduler aborts at graph_reserve. With `-nkvo`, real Q4 / F16 models load and run on `--device GCU0` (Q4 weights and KV stay CPU; activation math runs on GCU). An MVP-3b probe (manual D2D memcpy bypassing `topsatenIndexPut`) was 2-5× slower than `-nkvo` because per-call sync H2D of indices drains the stream — native cache offload needs an async index transfer or a custom GCU scatter kernel.
 - BF16 not supported.
 - Only `ROPE` mode 0 is implemented; YARN / NEOX / MROPE go to CPU.

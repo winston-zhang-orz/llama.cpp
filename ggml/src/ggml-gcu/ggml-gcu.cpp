@@ -766,7 +766,9 @@ static topsatenDataType_t ggml_to_topsaten_dtype(ggml_type t) {
 // time and stored as F16 on the device. This helper says which formats
 // we accept; non-supported Q-types fall back to CPU via supports_op.
 static bool gcu_q_supported(ggml_type t) {
-    return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K;
+    return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q8_0 ||
+           t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
+           t == GGML_TYPE_Q6_K || t == GGML_TYPE_Q3_K;
 }
 
 // Generic dequantize-to-F32 via ggml's per-type traits (libggml-base).

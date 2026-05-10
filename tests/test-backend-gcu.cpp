@@ -1479,6 +1479,9 @@ static int test_mul_mat_q_weight(ggml_backend_t gcu, ggml_type qt, const char * 
 static int test_mul_mat_q4_0(ggml_backend_t gcu) { return test_mul_mat_q_weight(gcu, GGML_TYPE_Q4_0, "MUL_MAT_Q4_0"); }
 static int test_mul_mat_q8_0(ggml_backend_t gcu) { return test_mul_mat_q_weight(gcu, GGML_TYPE_Q8_0, "MUL_MAT_Q8_0"); }
 static int test_mul_mat_q4_k(ggml_backend_t gcu) { return test_mul_mat_q_weight(gcu, GGML_TYPE_Q4_K, "MUL_MAT_Q4_K"); }
+static int test_mul_mat_q5_k(ggml_backend_t gcu) { return test_mul_mat_q_weight(gcu, GGML_TYPE_Q5_K, "MUL_MAT_Q5_K"); }
+static int test_mul_mat_q6_k(ggml_backend_t gcu) { return test_mul_mat_q_weight(gcu, GGML_TYPE_Q6_K, "MUL_MAT_Q6_K"); }
+static int test_mul_mat_q3_k(ggml_backend_t gcu) { return test_mul_mat_q_weight(gcu, GGML_TYPE_Q3_K, "MUL_MAT_Q3_K"); }
 
 // Element-wise MUL: dst = a * b on F32, large 2D tensor. Mirrors test_add.
 static int test_mul(ggml_backend_t gcu) {
@@ -2589,6 +2592,9 @@ static int test_q_weight_roundtrip(ggml_backend_t gcu, ggml_type qt, const char 
 static int test_q4_0_roundtrip(ggml_backend_t gcu) { return test_q_weight_roundtrip(gcu, GGML_TYPE_Q4_0, "Q4_0_ROUNDTRIP"); }
 static int test_q8_0_roundtrip(ggml_backend_t gcu) { return test_q_weight_roundtrip(gcu, GGML_TYPE_Q8_0, "Q8_0_ROUNDTRIP"); }
 static int test_q4_k_roundtrip(ggml_backend_t gcu) { return test_q_weight_roundtrip(gcu, GGML_TYPE_Q4_K, "Q4_K_ROUNDTRIP"); }
+static int test_q5_k_roundtrip(ggml_backend_t gcu) { return test_q_weight_roundtrip(gcu, GGML_TYPE_Q5_K, "Q5_K_ROUNDTRIP"); }
+static int test_q6_k_roundtrip(ggml_backend_t gcu) { return test_q_weight_roundtrip(gcu, GGML_TYPE_Q6_K, "Q6_K_ROUNDTRIP"); }
+static int test_q3_k_roundtrip(ggml_backend_t gcu) { return test_q_weight_roundtrip(gcu, GGML_TYPE_Q3_K, "Q3_K_ROUNDTRIP"); }
 
 // MUL_MAT_ID with **Q4_K weights** at Gemma 4 production sizes: K=2816,
 // M=1408 (= 2 * n_ff_exp), n_expert_used=8, n_tokens=2. Exercises the
@@ -4262,9 +4268,15 @@ int main() {
     rc |= test_mul_mat_q4_0(gcu);
     rc |= test_mul_mat_q8_0(gcu);
     rc |= test_mul_mat_q4_k(gcu);
+    rc |= test_mul_mat_q5_k(gcu);
+    rc |= test_mul_mat_q6_k(gcu);
+    rc |= test_mul_mat_q3_k(gcu);
     rc |= test_q4_0_roundtrip(gcu);
     rc |= test_q8_0_roundtrip(gcu);
     rc |= test_q4_k_roundtrip(gcu);
+    rc |= test_q5_k_roundtrip(gcu);
+    rc |= test_q6_k_roundtrip(gcu);
+    rc |= test_q3_k_roundtrip(gcu);
     rc |= test_silu(gcu);
     rc |= test_silu_f16(gcu);
     rc |= test_gelu(gcu);
