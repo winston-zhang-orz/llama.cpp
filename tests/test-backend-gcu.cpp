@@ -1264,6 +1264,99 @@ static int test_mul(ggml_backend_t gcu) {
     return 0;
 }
 
+// Tranche D2: SUB / DIV. Same template as MUL — F32, [M, N] = [4096, 4096].
+// DIV's rhs is shifted to [1, 3] to avoid div-by-zero.
+static int test_sub(ggml_backend_t gcu) {
+    const int64_t M = 4096, N = 4096;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_sub(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "SUB: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hb(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 51);
+    fill_random_f32(hb.data(), n, 52);
+    for (size_t i = 0; i < n; i++) expected[i] = ha[i] - hb[i];
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(b, hb.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "SUB: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!close_enough(hc[i], expected[i], 1e-5f, 1e-5f)) {
+            if (bad < 5) fprintf(stderr, "SUB: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "SUB: %d mismatches\n", bad); return 1; }
+    printf("SUB: ok (%zu elements)\n", n);
+    return 0;
+}
+
+static int test_div(ggml_backend_t gcu) {
+    const int64_t M = 4096, N = 4096;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_div(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "DIV: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hb(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 53);
+    fill_random_f32(hb.data(), n, 54);
+    for (size_t i = 0; i < n; i++) hb[i] += 2.0f;          // [1, 3], avoid div-by-zero
+    for (size_t i = 0; i < n; i++) expected[i] = ha[i] / hb[i];
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(b, hb.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "DIV: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!close_enough(hc[i], expected[i], 1e-5f, 1e-5f)) {
+            if (bad < 5) fprintf(stderr, "DIV: mismatch idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "DIV: %d mismatches\n", bad); return 1; }
+    printf("DIV: ok (%zu elements)\n", n);
+    return 0;
+}
+
 // SCALE: dst = a * scalar. F32 only (the GCU path lives in gcu_op_scale).
 static int test_scale(ggml_backend_t gcu) {
     const int64_t M = 512, N = 2048;
@@ -3501,6 +3594,8 @@ int main() {
     rc |= test_add_f16(gcu);
     rc |= test_mul(gcu);
     rc |= test_mul_f16(gcu);
+    rc |= test_sub(gcu);
+    rc |= test_div(gcu);
     rc |= test_scale(gcu);
     rc |= test_get_rows(gcu);
     rc |= test_set_rows(gcu);
