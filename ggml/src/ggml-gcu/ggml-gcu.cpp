@@ -1280,6 +1280,106 @@ static bool gcu_op_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// Tranche F: L2_NORM. ggml's CPU forward divides each row (along ne[0]) by
+// max(L2 norm, eps). topsatenNormalize computes y = x / sqrt(sum(|x|^p) + eps),
+// which differs from ggml in two ways:
+//   1) eps is added inside sqrt (vs. ggml's max-clamp on the divisor),
+//   2) the eps default is 1e-12 vs. ggml's typical 1e-6.
+// For typical inputs where sum(x^2) > eps^2 the results agree to within
+// numerical noise. This op is rarely emitted by LLM-style models; if a model
+// uses it with very small magnitudes the discrepancy could matter, but the
+// handler still matches ggml for the common case (eps tiny relative to L2).
+static bool gcu_op_l2_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    // Build descriptors in PyTorch order (slowest-first). Reduce dim is the
+    // innermost ggml dim (ne[0]) which is the last dim in PyTorch order.
+    gcu_tensor_dims din, dout;
+    topsatenTensor in_t  = make_topsaten_tensor(src, din);
+    topsatenTensor out_t = make_topsaten_tensor(dst, dout);
+
+    int rank = ggml_n_dims(src); if (rank < 1) rank = 1;
+    int64_t dim_arr[1] = { (int64_t)(rank - 1) };
+    topsatenSize_t dim_s(dim_arr, 1);
+    TOPSATEN_CHECK(topsatenNormalize(out_t, in_t, /*p=*/2.0f, dim_s, eps,
+                                     ctx->compute_stream));
+    return true;
+}
+
+// Tranche F: GROUP_NORM. ggml's CPU forward applies LayerNorm-style
+// (subtract mean, divide by sqrt(var+eps)) per group, where channels (ne[2])
+// are partitioned into n_groups. ggml has NO affine multiply/bias step; we
+// pass weight=ones / bias=zeros to topsatenGroupNorm to recover that.
+//
+// op_params layout: [int n_groups, float eps]
+static bool gcu_op_group_norm(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int32_t n_groups = ((const int32_t *) dst->op_params)[0];
+    float eps;
+    memcpy(&eps, (const float *) dst->op_params + 1, sizeof(float));
+
+    // ggml shape:  [ne0, ne1, ne2 (=channels), ne3 (=batch)]
+    // Build a PyTorch-NCHW tensor: [N=ne3, C=ne2, H=ne1, W=ne0].
+    const int64_t N = src->ne[3];
+    const int64_t C = src->ne[2];
+    const int64_t H = src->ne[1];
+    const int64_t W = src->ne[0];
+
+    const size_t bpe = ggml_type_size(src->type);
+    int64_t in_d[4]  = { N, C, H, W };
+    int64_t in_s[4]  = { (int64_t)(src->nb[3]/bpe), (int64_t)(src->nb[2]/bpe),
+                         (int64_t)(src->nb[1]/bpe), (int64_t)(src->nb[0]/bpe) };
+    int64_t out_d[4] = { N, C, H, W };
+    int64_t out_s[4] = { (int64_t)(dst->nb[3]/bpe), (int64_t)(dst->nb[2]/bpe),
+                         (int64_t)(dst->nb[1]/bpe), (int64_t)(dst->nb[0]/bpe) };
+
+    topsatenTensor in_t (topsatenSize_t(in_d, 4),  topsatenSize_t(in_s, 4),
+                         ggml_to_topsaten_dtype(src->type), src->data);
+    topsatenTensor out_t(topsatenSize_t(out_d, 4), topsatenSize_t(out_s, 4),
+                         ggml_to_topsaten_dtype(dst->type), dst->data);
+
+    // weight = ones[C], bias = zeros[C]. Reuse the shared per-context buffers.
+    void * ones_dev = gcu_get_ones_f32(ctx, C);
+    void * zero_dev = gcu_get_zero_bias(ctx, (size_t) C * sizeof(float));
+
+    int64_t affine_d[1] = { C };
+    int64_t affine_s[1] = { 1 };
+    topsatenTensor weight(topsatenSize_t(affine_d, 1), topsatenSize_t(affine_s, 1),
+                          TOPSATEN_DATA_FP32, ones_dev);
+    topsatenTensor bias  (topsatenSize_t(affine_d, 1), topsatenSize_t(affine_s, 1),
+                          TOPSATEN_DATA_FP32, zero_dev);
+
+    TOPSATEN_CHECK(topsatenGroupNorm(out_t, in_t, (int64_t) n_groups,
+                                     weight, bias, (double) eps,
+                                     ctx->compute_stream));
+    return true;
+}
+
+// Tranche F: LEAKY_RELU. y = x >= 0 ? x : negative_slope * x.
+// Note: ggml represents this as the top-level GGML_OP_LEAKY_RELU (not as a
+// GGML_UNARY_OP_*), with the negative_slope packed in op_params[0].
+static bool gcu_op_leaky_relu(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    float negative_slope;
+    memcpy(&negative_slope, dst->op_params, sizeof(float));
+
+    gcu_tensor_dims dout, din;
+    topsatenTensor out = make_topsaten_tensor(dst, dout);
+    topsatenTensor in  = make_topsaten_tensor(src, din);
+
+    topsatenScalar_t slope_s; slope_s.dtype = TOPSATEN_DATA_FP32; slope_s.fval = negative_slope;
+    TOPSATEN_CHECK(topsatenLeakyRelu(out, in, slope_s, ctx->compute_stream));
+    return true;
+}
+
 // MUL_MAT.
 //
 // ggml's MUL_MAT semantics: dst = src[0]^T @ src[1]
@@ -2720,6 +2820,12 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_clamp(ctx, node);
         case GGML_OP_CUMSUM:
             return gcu_op_cumsum(ctx, node);
+        case GGML_OP_L2_NORM:
+            return gcu_op_l2_norm(ctx, node);
+        case GGML_OP_GROUP_NORM:
+            return gcu_op_group_norm(ctx, node);
+        case GGML_OP_LEAKY_RELU:
+            return gcu_op_leaky_relu(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -3175,6 +3281,36 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!src) return false;
             if (src->type != GGML_TYPE_F32) return false;
             if (op->type  != GGML_TYPE_F32) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_L2_NORM: {
+            // CPU forward is F32-only; topsatenNormalize uses sqrt(sum+eps)
+            // vs ggml's max(sqrt(sum), eps), which agrees in practice when
+            // sum > eps^2 (always true for non-degenerate inputs).
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (src->type != GGML_TYPE_F32) return false;
+            if (op->type  != GGML_TYPE_F32) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_GROUP_NORM: {
+            // CPU forward is F32-only and has no affine; we feed weight=ones,
+            // bias=zeros to topsatenGroupNorm.
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (src->type != GGML_TYPE_F32) return false;
+            if (op->type  != GGML_TYPE_F32) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_LEAKY_RELU: {
+            // Element-wise unary, same dtype, contiguous. F32 + F16.
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (!gcu_dtype_supported(src->type)) return false;
+            if (src->type != op->type) return false;
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
             return true;
         }

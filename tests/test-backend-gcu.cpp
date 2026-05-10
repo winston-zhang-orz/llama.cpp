@@ -920,6 +920,202 @@ static int test_cos (ggml_backend_t gcu) {
     return run_unary_math_test(gcu, {"COS",  405, 1e-5f, 1e-5f, 0.0f, ggml_cos,  ref_cos });
 }
 
+// Tranche F: L2_NORM. y = x / max(sqrt(sum_lastdim(x^2)), eps).
+// Input shape: 2D [hidden, batch]. F32 only on CPU.
+static int test_l2_norm(ggml_backend_t gcu) {
+    const int64_t hidden = 1024, batch = 64;
+    const size_t  n   = (size_t) hidden * batch;
+    const float   eps = 1e-6f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, batch);
+    ggml_tensor * c = ggml_l2_norm(ctx, a, eps);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "L2_NORM: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 471);
+    for (int64_t b = 0; b < batch; b++) {
+        const float * row = ha.data() + b * hidden;
+        double sum2 = 0.0;
+        for (int64_t i = 0; i < hidden; i++) sum2 += (double)row[i] * row[i];
+        const float scale = 1.0f / std::fmax(std::sqrt((float)sum2), eps);
+        for (int64_t i = 0; i < hidden; i++) {
+            expected[b * hidden + i] = row[i] * scale;
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "L2_NORM: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        // Looser tolerance: topsatenNormalize uses sqrt(sum+eps) vs CPU's
+        // max(sqrt(sum), eps); diff is ~eps/(2*sum) for large sum.
+        if (!close_enough(hc[i], expected[i], 1e-4f, 1e-4f)) {
+            if (bad < 5) fprintf(stderr, "L2_NORM: mismatch idx=%zu got=%f want=%f\n",
+                                 i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "L2_NORM: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("L2_NORM: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
+// Tranche F: GROUP_NORM. Per-group LayerNorm-without-affine. Input shape:
+// [W, H, C, N] with C partitioned into n_groups. F32 only.
+static int test_group_norm(ggml_backend_t gcu) {
+    const int64_t W = 8, H = 8, C = 32, N = 2;
+    const int32_t n_groups = 4;
+    const float   eps = 1e-5f;
+    const size_t  n_per_group_chans = C / n_groups;
+    const size_t  n = (size_t) W * H * C * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, C, N);
+    ggml_tensor * c = ggml_group_norm(ctx, a, n_groups, eps);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "GROUP_NORM: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 472);
+
+    // CPU reference: per-(group, batch) compute mean+var over the group's
+    // channels and all H*W elements, then subtract mean and scale.
+    const size_t per_chan = (size_t) W * H;
+    for (int64_t i3 = 0; i3 < N; i3++) {
+        for (int32_t g = 0; g < n_groups; g++) {
+            const size_t ch_start = g * n_per_group_chans;
+            const size_t ch_end   = ch_start + n_per_group_chans;
+            const size_t group_n  = (ch_end - ch_start) * per_chan;
+
+            double sum = 0.0;
+            for (size_t ch = ch_start; ch < ch_end; ch++) {
+                const float * x = ha.data() + i3 * (W * H * C) + ch * per_chan;
+                for (size_t k = 0; k < per_chan; k++) sum += x[k];
+            }
+            const float mean = (float) (sum / (double) group_n);
+
+            double sum2 = 0.0;
+            for (size_t ch = ch_start; ch < ch_end; ch++) {
+                const float * x = ha.data() + i3 * (W * H * C) + ch * per_chan;
+                for (size_t k = 0; k < per_chan; k++) {
+                    const float d = x[k] - mean;
+                    sum2 += (double) d * d;
+                }
+            }
+            const float var = (float) (sum2 / (double) group_n);
+            const float scale = 1.0f / std::sqrt(var + eps);
+
+            for (size_t ch = ch_start; ch < ch_end; ch++) {
+                const float * x = ha.data()    + i3 * (W * H * C) + ch * per_chan;
+                float       * y = expected.data() + i3 * (W * H * C) + ch * per_chan;
+                for (size_t k = 0; k < per_chan; k++) {
+                    y[k] = (x[k] - mean) * scale;
+                }
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "GROUP_NORM: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 1e-4f, 1e-4f)) {
+            if (bad < 5) fprintf(stderr, "GROUP_NORM: mismatch idx=%zu got=%f want=%f\n",
+                                 i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "GROUP_NORM: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("GROUP_NORM: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
+// Tranche F: LEAKY_RELU. y = x >= 0 ? x : negative_slope * x. F32 1D smoke.
+static int test_leaky_relu(ggml_backend_t gcu) {
+    const size_t n = 4096;
+    const float negative_slope = 0.1f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_tensor * c = ggml_leaky_relu(ctx, a, negative_slope, /*inplace=*/false);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "LEAKY_RELU: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 473);
+    for (size_t i = 0; i < n; i++) expected[i] = ha[i] >= 0.0f ? ha[i] : negative_slope * ha[i];
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "LEAKY_RELU: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+
+    int   bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float err = std::fabs(hc[i] - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(hc[i], expected[i], 1e-5f, 1e-5f)) {
+            if (bad < 5) fprintf(stderr, "LEAKY_RELU: mismatch idx=%zu got=%f want=%f\n",
+                                 i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "LEAKY_RELU: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("LEAKY_RELU: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
 // MUL_MAT_MIXED variant with F16 input (instead of F32): F16w × F16x -> F32.
 // Fills the third dtype combo in the F16-weight family of MUL_MAT:
 //   F32w × F32x → F32   (test_mul_mat)
@@ -4046,6 +4242,9 @@ int main() {
     rc |= test_log(gcu);
     rc |= test_sin(gcu);
     rc |= test_cos(gcu);
+    rc |= test_l2_norm(gcu);
+    rc |= test_group_norm(gcu);
+    rc |= test_leaky_relu(gcu);
     rc |= test_async_overlap(gcu);
 
     const bool bench_ran = (rc == 0 && getenv("GCU_BENCH") != nullptr);
