@@ -3741,6 +3741,212 @@ static int test_relu_bf16(ggml_backend_t gcu) {
     return 0;
 }
 
+// MVP-5a/3: BF16 norm + softmax. RMS_NORM and NORM gained a BF16 affine
+// branch at the same time as F16 (gcu_op_rms_norm / gcu_op_norm); SOFT_MAX
+// rides the same dtype-pass-through scratch path the F16 case uses.
+//
+// Tolerance is wider than the F16 norm tests because the per-row reduction
+// (1024 wide) accumulates BF16 rounding more aggressively. Reference
+// computes mean / variance / softmax in F64 from BF16-rounded inputs.
+
+static int test_rms_norm_bf16(ggml_backend_t gcu) {
+    const int64_t hidden = 1024, batch = 64;
+    const size_t  n = (size_t) hidden * batch;
+    const float   eps = 1e-6f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, hidden, batch);
+    ggml_tensor * c = ggml_rms_norm(ctx, a, eps);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "RMS_NORM_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>      ha_f32(n), expected(n);
+    std::vector<ggml_bf16_t> ha(n), hc(n);
+    fill_random_f32(ha_f32.data(), n, 1331);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), n);
+    for (int64_t b = 0; b < batch; b++) {
+        double s = 0.0;
+        for (int64_t i = 0; i < hidden; i++) {
+            const float x = ggml_bf16_to_fp32(ha[b * hidden + i]);
+            s += (double) x * x;
+        }
+        const float scale = 1.0f / std::sqrt((float)(s / hidden) + eps);
+        for (int64_t i = 0; i < hidden; i++) {
+            const float x = ggml_bf16_to_fp32(ha[b * hidden + i]);
+            expected[b * hidden + i] = x * scale;
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(ggml_bf16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "RMS_NORM_BF16: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(ggml_bf16_t));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float got = ggml_bf16_to_fp32(hc[i]);
+        const float err = std::fabs(got - expected[i]);
+        if (err > max_err) max_err = err;
+        // RMS_NORM has a 1024-wide reduction; BF16's 8-bit mantissa adds
+        // ~3% drift in worst case. Atol of 5e-2 / rtol 5e-2 covers it.
+        if (!close_enough(got, expected[i], 5e-2f, 5e-2f)) {
+            if (bad < 5) fprintf(stderr, "RMS_NORM_BF16: mismatch idx=%zu got=%f want=%f\n", i, got, expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "RMS_NORM_BF16: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("RMS_NORM_BF16: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
+static int test_norm_bf16(ggml_backend_t gcu) {
+    const int64_t hidden = 1024, batch = 64;
+    const size_t  n = (size_t) hidden * batch;
+    const float   eps = 1e-5f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, hidden, batch);
+    ggml_tensor * c = ggml_norm(ctx, a, eps);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "NORM_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>      ha_f32(n), expected(n);
+    std::vector<ggml_bf16_t> ha(n), hc(n);
+    fill_random_f32(ha_f32.data(), n, 1341);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), n);
+
+    for (int64_t b = 0; b < batch; b++) {
+        double sum = 0.0;
+        for (int64_t i = 0; i < hidden; i++) sum += ggml_bf16_to_fp32(ha[b * hidden + i]);
+        const float mean = (float)(sum / hidden);
+        double vsum = 0.0;
+        for (int64_t i = 0; i < hidden; i++) {
+            const float d = ggml_bf16_to_fp32(ha[b * hidden + i]) - mean;
+            vsum += (double) d * d;
+        }
+        const float scale = 1.0f / std::sqrt((float)(vsum / hidden) + eps);
+        for (int64_t i = 0; i < hidden; i++) {
+            const float v = ggml_bf16_to_fp32(ha[b * hidden + i]);
+            expected[b * hidden + i] = (v - mean) * scale;
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(ggml_bf16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "NORM_BF16: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(ggml_bf16_t));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float got = ggml_bf16_to_fp32(hc[i]);
+        const float err = std::fabs(got - expected[i]);
+        if (err > max_err) max_err = err;
+        if (!close_enough(got, expected[i], 5e-2f, 5e-2f)) {
+            if (bad < 5) fprintf(stderr, "NORM_BF16: mismatch idx=%zu got=%f want=%f\n", i, got, expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "NORM_BF16: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("NORM_BF16: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
+static int test_softmax_bf16(ggml_backend_t gcu) {
+    const int64_t cols = 1024, rows = 16;
+    const size_t  n = (size_t) cols * rows;
+    const float   scale = 0.125f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a    = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, cols, rows);
+    // ggml's soft_max API constrains mask to F16 or F32. Real BF16 models
+    // emit an F16 mask via the standard llama-graph KV-cache fast path, so
+    // BF16 input + F16 mask is the production combination we need to cover.
+    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, cols, rows);
+    ggml_tensor * c    = ggml_soft_max_ext(ctx, a, mask, scale, 0.0f);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "SOFT_MAX_BF16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       ha_f32(n), hm_f32(n), expected(n);
+    std::vector<ggml_bf16_t> ha(n), hc(n);
+    std::vector<ggml_fp16_t> hm(n);
+    fill_random_f32(ha_f32.data(), n, 1351);
+    fill_random_f32(hm_f32.data(), n, 1352);
+    ggml_fp32_to_bf16_row(ha_f32.data(), ha.data(), n);
+    ggml_fp32_to_fp16_row(hm_f32.data(), hm.data(), n);
+    for (int64_t r = 0; r < rows; r++) {
+        float emax = -INFINITY;
+        for (int64_t i = 0; i < cols; i++) {
+            const float v = ggml_bf16_to_fp32(ha[r * cols + i]) * scale +
+                            ggml_fp16_to_fp32(hm[r * cols + i]);
+            if (v > emax) emax = v;
+        }
+        double sum = 0.0;
+        for (int64_t i = 0; i < cols; i++) {
+            const float v = ggml_bf16_to_fp32(ha[r * cols + i]) * scale +
+                            ggml_fp16_to_fp32(hm[r * cols + i]);
+            const float e = std::exp(v - emax);
+            expected[r * cols + i] = e;
+            sum += e;
+        }
+        for (int64_t i = 0; i < cols; i++) expected[r * cols + i] /= (float) sum;
+    }
+
+    ggml_backend_tensor_set(a,    ha.data(), 0, n * sizeof(ggml_bf16_t));
+    ggml_backend_tensor_set(mask, hm.data(), 0, n * sizeof(ggml_fp16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "SOFT_MAX_BF16: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(ggml_bf16_t));
+
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float got = ggml_bf16_to_fp32(hc[i]);
+        const float err = std::fabs(got - expected[i]);
+        if (err > max_err) max_err = err;
+        // softmax outputs are O(1/cols) so absolute tolerance can be tight
+        // even with looser BF16 mantissa; per-element values are small.
+        if (!close_enough(got, expected[i], 5e-3f, 1e-2f)) {
+            if (bad < 5) fprintf(stderr, "SOFT_MAX_BF16: mismatch idx=%zu got=%f want=%f\n", i, got, expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "SOFT_MAX_BF16: %d mismatches (max_abs_err=%f)\n", bad, max_err); return 1; }
+    printf("SOFT_MAX_BF16: ok (%zu elements, max_abs_err=%f)\n", n, max_err);
+    return 0;
+}
+
 // MVP-5b: ARGMAX / TOP_K / ARGSORT smoke tests.
 
 // ARGMAX. Input rank-2 [ne0, ne1] F32 → output rank-1 [ne1] I32.
@@ -4684,6 +4890,9 @@ int main() {
     rc |= test_silu_bf16(gcu);
     rc |= test_gelu_bf16(gcu);
     rc |= test_relu_bf16(gcu);
+    rc |= test_rms_norm_bf16(gcu);
+    rc |= test_norm_bf16(gcu);
+    rc |= test_softmax_bf16(gcu);
     rc |= test_mul_mat_mixed(gcu);
     rc |= test_mul_mat_mixed_f16in(gcu);
     rc |= test_mul_mat_id(gcu);

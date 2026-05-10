@@ -2186,8 +2186,34 @@ static bool gcu_op_soft_max(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     }
 
     // scratch += mask (with alpha=1)
+    //
+    // ggml constrains mask dtype to F16 or F32, while x can also be BF16.
+    // topsatenAdd refuses mixed dtypes, so when mask dtype differs from x
+    // we cast mask into a per-call scratch (small — same shape as mask)
+    // before the add. Real BF16 models hit the BF16 input + F16 mask path.
+    void * mask_cast_buf  = nullptr;
+    size_t mask_cast_bytes = 0;
     if (mask) {
         topsatenTensor mask_t = make_topsaten_tensor(mask, d_mask);
+        if (mask->type != dst->type) {
+            mask_cast_bytes = (size_t) ggml_nelements(mask) * ggml_type_size(dst->type);
+            mask_cast_buf   = ctx->pool.alloc(mask_cast_bytes);
+            // Build a contiguous descriptor for the cast destination using
+            // mask's element shape (same shape, target dtype, packed strides).
+            int rank_m = ggml_n_dims(mask); if (rank_m < 1) rank_m = 1;
+            int64_t md[GGML_MAX_DIMS];
+            int64_t ms[GGML_MAX_DIMS];
+            for (int i = 0; i < rank_m; i++) md[i] = mask->ne[rank_m - 1 - i];
+            ms[rank_m - 1] = 1;
+            for (int i = rank_m - 2; i >= 0; i--) ms[i] = ms[i + 1] * md[i + 1];
+            topsatenDataType_t target = ggml_to_topsaten_dtype(dst->type);
+            topsatenTensor mask_cast_t(topsatenSize_t(md, rank_m),
+                                       topsatenSize_t(ms, rank_m),
+                                       target, mask_cast_buf);
+            TOPSATEN_CHECK(topsatenTo(mask_cast_t, mask_t, target, false, true,
+                                      TOPSATEN_MEMORY_CONTIGUOUS, ctx->compute_stream));
+            mask_t = mask_cast_t;
+        }
         topsatenScalar_t alpha; alpha.dtype = TOPSATEN_DATA_FP32; alpha.fval = 1.0;
         TOPSATEN_CHECK(topsatenAdd(scratch_t, scratch_t, mask_t, alpha, ctx->compute_stream));
     }
@@ -2196,7 +2222,8 @@ static bool gcu_op_soft_max(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     int rank = ggml_n_dims(dst); if (rank < 1) rank = 1;
     TOPSATEN_CHECK(topsatenSoftmaxForward(out_t, scratch_t, rank - 1, ctx->compute_stream));
 
-    gcu_release_scratch(ctx, scratch, bytes);
+    gcu_release_scratch(ctx, scratch,        bytes);
+    gcu_release_scratch(ctx, mask_cast_buf,  mask_cast_bytes);
     return true;
 }
 
@@ -3456,7 +3483,13 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (op->src[2] != nullptr) return false;   // softmax sinks: MVP-3
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
-            if (op->src[1] && !gcu_dtype_supported(op->src[1]->type)) return false;
+            // mask dtype is constrained by ggml itself to F16 or F32 (see
+            // ggml_soft_max_ext_impl); accept either here, the handler
+            // casts mask -> dst dtype on the fly when they differ.
+            if (op->src[1]) {
+                const ggml_type mt = op->src[1]->type;
+                if (mt != GGML_TYPE_F16 && mt != GGML_TYPE_F32) return false;
+            }
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
             return true;
         }
