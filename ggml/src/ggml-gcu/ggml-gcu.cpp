@@ -2415,6 +2415,46 @@ static bool gcu_op_cos(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
     return true;
 }
 
+// Tranche D4: reductions (SUM / SUM_ROWS / MEAN).
+//
+// ggml's contract:
+//   SUM        — scalar, sum over all elements;       ggml output ne = {1, 1, 1, 1}
+//   SUM_ROWS   — innermost reduce, keepdim;            ggml output ne = {1, ne01, ne02, ne03}
+//   MEAN       — same as SUM_ROWS but divides by ne00; ggml output ne = {1, ne01, ne02, ne03}
+//
+// CPU forward is F32-only for these ops (see ops.cpp); we match that
+// gate so cross-backend behaviour matches.
+
+static bool gcu_op_sum(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+
+    gcu_tensor_dims din;
+    topsatenTensor in_t = make_topsaten_tensor(src, din);
+
+    // Output: rank-1 size-1 scalar tensor backed by ggml's dst buffer.
+    int64_t out_d[1] = { 1 };
+    int64_t out_s[1] = { 1 };
+    topsatenTensor out_t(topsatenSize_t(out_d, 1), topsatenSize_t(out_s, 1),
+                         TOPSATEN_DATA_FP32, dst->data);
+
+    // Full reduction: pass the topsatenSum overload that takes only a
+    // dtype (no `dim` argument) — sums all elements.
+    TOPSATEN_CHECK(topsatenSum(out_t, in_t, TOPSATEN_DATA_FP32, ctx->compute_stream));
+    return true;
+}
+
+// SUM_ROWS / MEAN: reduce ggml's innermost dim (ne[0]) with keepdim. We
+// implement these by using topsatenSum/Mean's "reduce-all-elements"
+// overload on a per-row basis is too expensive; the dim-list overload
+// instead requires careful descriptor handling. Smoke tests of various
+// shape variants pass, but the canary Gemma 4 26B A4B segfaults inside
+// topsatenSum at runtime even with simple [n_expert_used, n_tokens]
+// inputs. Until that is rooted out, gate SUM_ROWS / MEAN out at
+// supports_op so the scheduler keeps them on CPU. Gemma 4's only
+// SUM_ROWS use site is the MoE weight normalization (CPU-fast).
+
 // MVP-5b: sampling helper ops (ARGMAX / TOP_K / ARGSORT).
 //
 // These reduce / sort along ggml's innermost dim (ne[0]) and produce I32
@@ -2610,6 +2650,8 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_sin(ctx, node);
         case GGML_OP_COS:
             return gcu_op_cos(ctx, node);
+        case GGML_OP_SUM:
+            return gcu_op_sum(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -3026,6 +3068,22 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!gcu_dtype_supported(op->src[0]->type)) return false;
             if (op->src[0]->type != op->type) return false;
             if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_SUM: {
+            // SUM (full reduction → scalar). F32 only. CPU forward is
+            // F32/F16/BF16 — we match the F32 fast-path; F16/BF16 stay on
+            // CPU. SUM_ROWS / MEAN are also dim-reductions but the dim-list
+            // overload of topsatenSum/Mean segfaults inside the SDK on
+            // real-model shapes (Gemma 4 26B A4B [n_expert_used,
+            // n_tokens]); their handlers were removed and the ops fall
+            // back to CPU. Revisit when we have a way to bisect inside
+            // the SDK kernel.
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (src->type != GGML_TYPE_F32) return false;
+            if (op->type  != GGML_TYPE_F32) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
             return true;
         }
         case GGML_OP_ROPE: {

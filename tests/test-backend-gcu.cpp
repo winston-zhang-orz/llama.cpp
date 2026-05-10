@@ -1357,6 +1357,248 @@ static int test_div(ggml_backend_t gcu) {
     return 0;
 }
 
+// Tranche D4: SUM (full reduction → scalar).
+static int test_sum(ggml_backend_t gcu) {
+    const int64_t M = 1024, N = 256;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_sum(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "SUM: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n);
+    fill_random_f32(ha.data(), n, 71);
+    double expected = 0.0;
+    for (size_t i = 0; i < n; i++) expected += ha[i];
+
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "SUM: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    float got = 0.0f;
+    ggml_backend_tensor_get(c, &got, 0, sizeof(float));
+
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    const float exp_f = (float) expected;
+    if (!close_enough(got, exp_f, 1e-2f, 1e-4f)) {
+        fprintf(stderr, "SUM: got=%f want=%f\n", got, exp_f);
+        return 1;
+    }
+    printf("SUM: ok (got=%f, want=%f)\n", got, exp_f);
+    return 0;
+}
+
+#if 0  // SUM_ROWS / MEAN handlers gated out (SDK segfault on Gemma 4 shapes).
+// Decode-shape MoE weight normalization: src is [n_expert_used, n_tokens]
+// where n_tokens=1 at decode. Stresses the rank-1-reduction path that
+// the prefill-shape smoke doesn't exercise.
+static int test_sum_rows_moe_decode(ggml_backend_t gcu) {
+    const int64_t n_expert_used = 8, n_tokens = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert_used, n_tokens);
+    ggml_tensor * c = ggml_sum_rows(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "SUM_ROWS_MOE: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n_expert_used * n_tokens), hc(n_tokens), expected(n_tokens);
+    fill_random_f32(ha.data(), ha.size(), 74);
+    for (int64_t r = 0; r < n_tokens; r++) {
+        double s = 0.0;
+        for (int64_t k = 0; k < n_expert_used; k++) s += ha[r * n_expert_used + k];
+        expected[r] = (float) s;
+    }
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "SUM_ROWS_MOE: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n_tokens * sizeof(float));
+
+    int bad = 0;
+    for (int64_t r = 0; r < n_tokens; r++) {
+        if (!close_enough(hc[r], expected[r], 1e-5f, 1e-4f)) {
+            if (bad < 5) fprintf(stderr, "SUM_ROWS_MOE: r=%lld got=%f want=%f\n",
+                                 (long long) r, hc[r], expected[r]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "SUM_ROWS_MOE: %d mismatches\n", bad); return 1; }
+    printf("SUM_ROWS_MOE: ok\n");
+    return 0;
+}
+
+// Tranche D4: SUM_ROWS — innermost-dim reduce, keepdim. ggml output is
+// rank-4 with ne[0]=1, the other ne[*] = src->ne[*].
+static int test_sum_rows(ggml_backend_t gcu) {
+    const int64_t M = 4096, N = 64;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_sum_rows(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "SUM_ROWS: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(N), expected(N);
+    fill_random_f32(ha.data(), n, 72);
+    for (int64_t r = 0; r < N; r++) {
+        double s = 0.0;
+        for (int64_t k = 0; k < M; k++) s += ha[r * M + k];
+        expected[r] = (float) s;
+    }
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "SUM_ROWS: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, N * sizeof(float));
+
+    int bad = 0;
+    for (int64_t r = 0; r < N; r++) {
+        if (!close_enough(hc[r], expected[r], 1e-2f, 1e-4f)) {
+            if (bad < 5) fprintf(stderr, "SUM_ROWS: r=%lld got=%f want=%f\n",
+                                 (long long) r, hc[r], expected[r]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "SUM_ROWS: %d mismatches\n", bad); return 1; }
+    printf("SUM_ROWS: ok (%d rows of %d elems)\n", (int) N, (int) M);
+    return 0;
+}
+
+static int test_mean(ggml_backend_t gcu) {
+    const int64_t M = 4096, N = 64;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_mean(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "MEAN: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(N), expected(N);
+    fill_random_f32(ha.data(), n, 73);
+    for (int64_t r = 0; r < N; r++) {
+        double s = 0.0;
+        for (int64_t k = 0; k < M; k++) s += ha[r * M + k];
+        expected[r] = (float) (s / (double) M);
+    }
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "MEAN: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, N * sizeof(float));
+
+    int bad = 0;
+    for (int64_t r = 0; r < N; r++) {
+        if (!close_enough(hc[r], expected[r], 1e-5f, 1e-4f)) {
+            if (bad < 5) fprintf(stderr, "MEAN: r=%lld got=%f want=%f\n",
+                                 (long long) r, hc[r], expected[r]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "MEAN: %d mismatches\n", bad); return 1; }
+    printf("MEAN: ok (%d rows of %d elems)\n", (int) N, (int) M);
+    return 0;
+}
+#endif  // SUM_ROWS / MEAN gated out
+
+// Tranche D2 follow-up: broadcast DIV at MoE-decode shape:
+// [n_expert_used, n_tokens] / [1, n_tokens]. Mirrors the Gemma 4 ffn
+// weight-normalization div.
+static int test_div_moe_decode(ggml_backend_t gcu) {
+    const int64_t n_expert_used = 8, n_tokens = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert_used, n_tokens);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+    ggml_tensor * c = ggml_div(ctx, a, b);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "DIV_MOE: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n_expert_used * n_tokens), hb(n_tokens), hc(n_expert_used * n_tokens), expected(n_expert_used * n_tokens);
+    fill_random_f32(ha.data(), ha.size(), 81);
+    fill_random_f32(hb.data(), hb.size(), 82);
+    for (size_t i = 0; i < hb.size(); i++) hb[i] += 2.0f;
+    for (int64_t r = 0; r < n_tokens; r++) {
+        for (int64_t k = 0; k < n_expert_used; k++) {
+            expected[r * n_expert_used + k] = ha[r * n_expert_used + k] / hb[r];
+        }
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_backend_tensor_set(b, hb.data(), 0, hb.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "DIV_MOE: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(float));
+    int bad = 0;
+    for (size_t i = 0; i < hc.size(); i++) {
+        if (!close_enough(hc[i], expected[i], 1e-5f, 1e-5f)) {
+            if (bad < 5) fprintf(stderr, "DIV_MOE: idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "DIV_MOE: %d mismatches\n", bad); return 1; }
+    printf("DIV_MOE: ok\n");
+    return 0;
+}
+
 // Tranche D3: ADD1. a is any tensor, b is a 1-element scalar tensor;
 // dst = a + b[0].
 static int test_add1(ggml_backend_t gcu) {
@@ -3644,7 +3886,9 @@ int main() {
     rc |= test_mul_f16(gcu);
     rc |= test_sub(gcu);
     rc |= test_div(gcu);
+    rc |= test_div_moe_decode(gcu);
     rc |= test_add1(gcu);
+    rc |= test_sum(gcu);
     rc |= test_scale(gcu);
     rc |= test_get_rows(gcu);
     rc |= test_set_rows(gcu);
