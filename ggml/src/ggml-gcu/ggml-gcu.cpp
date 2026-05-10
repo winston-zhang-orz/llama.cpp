@@ -2240,6 +2240,140 @@ static bool gcu_op_hardsigmoid(ggml_backend_gcu_context * ctx, ggml_tensor * dst
     return true;
 }
 
+// MVP-5b: sampling helper ops (ARGMAX / TOP_K / ARGSORT).
+//
+// These reduce / sort along ggml's innermost dim (ne[0]) and produce I32
+// indices. ggml stores ne[]/nb[] reversed-PyTorch (slowest-last); the
+// make_topsaten_tensor helper flips them to PyTorch order (slowest-first),
+// so ggml's "dim 0" maps to topsaten "dim rank-1".
+//
+// The topsaten Topk/ArgSort APIs return I64 indices (PyTorch ATen
+// convention), so we allocate an I64 scratch and cast to I32 with
+// topsatenTo before placing into the ggml dst buffer.
+
+// ARGMAX. Input: rank-2 F32/F16 [ne0, ne1]. Output: rank-1 I32 [ne1].
+// Reduces along innermost dim (ggml dim 0 == PyTorch last dim).
+static bool gcu_op_argmax(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    // PyTorch order: input is [ne1, ne0]; reduce dim 1 (== last dim).
+    // Output (keepdims=false) is [ne1], rank 1.
+    const int64_t ne0 = src->ne[0];
+    const int64_t ne1 = src->ne[1];
+    const size_t  in_bpe = ggml_type_size(src->type);
+
+    int64_t in_d[2] = { ne1, ne0 };
+    int64_t in_s[2] = { (int64_t) (src->nb[1] / in_bpe), (int64_t) (src->nb[0] / in_bpe) };
+    topsatenTensor in_t(topsatenSize_t(in_d, 2), topsatenSize_t(in_s, 2),
+                        ggml_to_topsaten_dtype(src->type), src->data);
+
+    int64_t out_d[1] = { ne1 };
+    int64_t out_s[1] = { 1 };
+    topsatenTensor out_t(topsatenSize_t(out_d, 1), topsatenSize_t(out_s, 1),
+                         TOPSATEN_DATA_I32, dst->data);
+
+    topsatenScalar_t dim_s;
+    dim_s.dtype = TOPSATEN_DATA_I64;
+    dim_s.ival  = 1;  // last dim in PyTorch order
+    TOPSATEN_CHECK(topsatenArgmax(out_t, in_t, dim_s, /*keepdims=*/false,
+                                  ctx->compute_stream));
+    return true;
+}
+
+// TOP_K. Returns I32 indices of the k largest along innermost dim.
+// ggml shape: input [ne00, ne01, ne02, ne03], output [k, ne01, ne02, ne03] I32.
+// Per ggml's contract: "the resulting top k indices are in no particular
+// order". We pass is_sorted=true to keep behavior deterministic; ggml does
+// not require a particular order.
+//
+// SDK note: topsatenTopk's index tensor must be I32 / U32 (not I64 — this
+// is the one place its dtype contract diverges from PyTorch ATen). We
+// write directly into ggml's I32 dst buffer.
+static bool gcu_op_top_k(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const int64_t k = dst->ne[0];
+
+    // Input descriptor in PyTorch order via the standard helper.
+    gcu_tensor_dims din;
+    topsatenTensor in_t = make_topsaten_tensor(src, din);
+    const int rank = ggml_n_dims(src) < 1 ? 1 : ggml_n_dims(src);
+
+    // Output value scratch (same dtype as input, same shape as dst but with
+    // ne[0] = k along the reduce dim). We don't use this; ggml only wants
+    // indices.
+    const size_t val_bytes = (size_t) ggml_nelements(dst) * ggml_type_size(src->type);
+    void * val_buf = ctx->pool.alloc(val_bytes);
+
+    // Output shape in PyTorch order: input shape with the last dim replaced
+    // by k. Strides packed (dst is fully contiguous I32 — gated in
+    // supports_op — so we can use packed strides for both the value scratch
+    // and the index dst).
+    int64_t out_d[GGML_MAX_DIMS];
+    int64_t out_s[GGML_MAX_DIMS];
+    for (int i = 0; i < rank; i++) {
+        out_d[i] = (i == rank - 1) ? k : din.dims[i];
+    }
+    out_s[rank - 1] = 1;
+    for (int i = rank - 2; i >= 0; i--) {
+        out_s[i] = out_s[i + 1] * out_d[i + 1];
+    }
+
+    topsatenTensor val_t(topsatenSize_t(out_d, rank), topsatenSize_t(out_s, rank),
+                         ggml_to_topsaten_dtype(src->type), val_buf);
+    topsatenTensor idx_t(topsatenSize_t(out_d, rank), topsatenSize_t(out_s, rank),
+                         TOPSATEN_DATA_I32, dst->data);
+
+    TOPSATEN_CHECK(topsatenTopk(val_t, idx_t, in_t,
+                                /*k=*/k, /*axis=*/rank - 1,
+                                /*is_largest=*/true, /*is_sorted=*/true,
+                                ctx->compute_stream));
+
+    gcu_release_scratch(ctx, val_buf, val_bytes);
+    return true;
+}
+
+// ARGSORT. Returns I32 indices that sort the input along innermost dim.
+// ggml shape: output is same shape as input but I32 dtype.
+// op_params[0] is ggml_sort_order (0=ASC, 1=DESC).
+//
+// We try the direct I32 dst path first; if the SDK happens to require I64
+// at runtime we'd need to add a cast hop, but in this SDK version
+// topsatenArgSort accepts I32 indices (matching the topsatenTopk
+// constraint observed at runtime).
+static bool gcu_op_argsort(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const int32_t order = ((const int32_t *) dst->op_params)[0];
+    const bool descending = (order == GGML_SORT_ORDER_DESC);
+
+    // Input descriptor in PyTorch order.
+    gcu_tensor_dims din;
+    topsatenTensor in_t = make_topsaten_tensor(src, din);
+    const int rank = ggml_n_dims(src) < 1 ? 1 : ggml_n_dims(src);
+
+    // Output shape == input shape (PyTorch order). Packed strides because
+    // dst is fully contiguous I32 (gated in supports_op).
+    int64_t out_d[GGML_MAX_DIMS];
+    int64_t out_s[GGML_MAX_DIMS];
+    for (int i = 0; i < rank; i++) out_d[i] = din.dims[i];
+    out_s[rank - 1] = 1;
+    for (int i = rank - 2; i >= 0; i--) {
+        out_s[i] = out_s[i + 1] * out_d[i + 1];
+    }
+
+    topsatenTensor idx_t(topsatenSize_t(out_d, rank), topsatenSize_t(out_s, rank),
+                         TOPSATEN_DATA_I32, dst->data);
+
+    TOPSATEN_CHECK(topsatenArgSort(idx_t, in_t,
+                                   /*stable=*/false, /*dim=*/rank - 1,
+                                   descending, ctx->compute_stream));
+    return true;
+}
+
 static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node) {
     switch (node->op) {
         case GGML_OP_RESHAPE:
@@ -2279,6 +2413,12 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_rope(ctx, node);
         case GGML_OP_GLU:
             return gcu_op_glu(ctx, node);
+        case GGML_OP_ARGMAX:
+            return gcu_op_argmax(ctx, node);
+        case GGML_OP_TOP_K:
+            return gcu_op_top_k(ctx, node);
+        case GGML_OP_ARGSORT:
+            return gcu_op_argsort(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -2622,6 +2762,42 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!gcu_dtype_supported(a->type)) return false;
             if (a->type != b->type || a->type != op->type) return false;
             if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_ARGMAX: {
+            // ggml's argmax is matrix-only (rank 2) and emits I32 of
+            // shape [ne1]. We accept F32/F16 input.
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (!gcu_dtype_supported(src->type)) return false;
+            if (op->type != GGML_TYPE_I32) return false;
+            if (!ggml_is_matrix(src)) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        case GGML_OP_TOP_K: {
+            // ggml emits I32 indices [k, ne01, ne02, ne03]; input must be
+            // F32 or F16, contiguous, with k <= ne00.
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (!gcu_dtype_supported(src->type)) return false;
+            if (op->type != GGML_TYPE_I32) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            // dst keeps src's outer shape; ne[0] is k.
+            if (op->ne[0] > src->ne[0]) return false;
+            if (op->ne[1] != src->ne[1] || op->ne[2] != src->ne[2] || op->ne[3] != src->ne[3]) return false;
+            return true;
+        }
+        case GGML_OP_ARGSORT: {
+            // ggml emits I32 indices same shape as input. ASC and DESC
+            // accepted; topsatenArgSort takes a `descending` bool.
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (!gcu_dtype_supported(src->type)) return false;
+            if (op->type != GGML_TYPE_I32) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            const int32_t order = ((const int32_t *) op->op_params)[0];
+            if (order != GGML_SORT_ORDER_ASC && order != GGML_SORT_ORDER_DESC) return false;
             return true;
         }
         case GGML_OP_ROPE: {

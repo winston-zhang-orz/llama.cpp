@@ -2533,6 +2533,388 @@ static int test_rope_f16(ggml_backend_t gcu) {
     return 0;
 }
 
+// MVP-5b: ARGMAX / TOP_K / ARGSORT smoke tests.
+
+// ARGMAX. Input rank-2 [ne0, ne1] F32 → output rank-1 [ne1] I32.
+static int test_argmax(ggml_backend_t gcu) {
+    const int64_t ne0 = 256;
+    const int64_t ne1 = 64;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+    ggml_tensor * c = ggml_argmax(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ARGMAX: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>   ha((size_t) ne0 * ne1);
+    std::vector<int32_t> hc((size_t) ne1);
+    std::vector<int32_t> expected((size_t) ne1);
+    fill_random_f32(ha.data(), ha.size(), 401);
+    for (int64_t r = 0; r < ne1; r++) {
+        const float * row = ha.data() + (size_t) r * ne0;
+        int32_t best = 0;
+        float bv = row[0];
+        for (int64_t i = 1; i < ne0; i++) {
+            if (row[i] > bv) { bv = row[i]; best = (int32_t) i; }
+        }
+        expected[r] = best;
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ARGMAX: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(int32_t));
+
+    int bad = 0;
+    for (int64_t r = 0; r < ne1; r++) {
+        if (hc[r] != expected[r]) {
+            if (bad < 5) fprintf(stderr, "ARGMAX: row=%lld got=%d want=%d\n",
+                                 (long long) r, hc[r], expected[r]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ARGMAX: %d mismatches\n", bad); return 1; }
+    printf("ARGMAX: ok (%lld rows of %lld)\n", (long long) ne1, (long long) ne0);
+    return 0;
+}
+
+// ARGMAX at vocab-scale shape (ne0=32000, ne1=1) — confirms the SDK
+// handles the real-model reduction width.
+static int test_argmax_vocab(ggml_backend_t gcu) {
+    const int64_t ne0 = 32000;
+    const int64_t ne1 = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+    ggml_tensor * c = ggml_argmax(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ARGMAX_VOCAB: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>   ha((size_t) ne0);
+    std::vector<int32_t> hc(1);
+    fill_random_f32(ha.data(), ha.size(), 402);
+    int32_t expected = 0;
+    for (int64_t i = 1; i < ne0; i++) if (ha[i] > ha[expected]) expected = (int32_t) i;
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ARGMAX_VOCAB: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, sizeof(int32_t));
+
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (hc[0] != expected) {
+        fprintf(stderr, "ARGMAX_VOCAB: got=%d want=%d\n", hc[0], expected);
+        return 1;
+    }
+    printf("ARGMAX_VOCAB: ok (n=%lld idx=%d)\n", (long long) ne0, hc[0]);
+    return 0;
+}
+
+// TOP_K. Returns I32 indices of the k largest along dim 0.
+// Per ggml's contract, "the resulting top k indices are in no particular
+// order" — we compare as a *set* to be tolerant of any ordering.
+static int test_top_k(ggml_backend_t gcu) {
+    const int64_t ne0 = 256;
+    const int64_t ne1 = 16;
+    const int     k   = 8;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+    ggml_tensor * c = ggml_top_k(ctx, a, k);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "TOP_K: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>   ha((size_t) ne0 * ne1);
+    std::vector<int32_t> hc((size_t) k * ne1);
+    fill_random_f32(ha.data(), ha.size(), 411);
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "TOP_K: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(int32_t));
+
+    int bad = 0;
+    for (int64_t r = 0; r < ne1; r++) {
+        const float * row = ha.data() + (size_t) r * ne0;
+
+        // Reference: full argsort descending, take first k.
+        std::vector<int32_t> idx((size_t) ne0);
+        for (int64_t i = 0; i < ne0; i++) idx[i] = (int32_t) i;
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                          [&](int32_t a_, int32_t b_) { return row[a_] > row[b_]; });
+
+        std::vector<int32_t> ref(idx.begin(), idx.begin() + k);
+        std::vector<int32_t> got(hc.begin() + (size_t) r * k,
+                                 hc.begin() + (size_t) r * k + k);
+        std::sort(ref.begin(), ref.end());
+        std::sort(got.begin(), got.end());
+        if (ref != got) {
+            if (bad < 3) {
+                fprintf(stderr, "TOP_K: row=%lld set mismatch: got=", (long long) r);
+                for (int i = 0; i < k; i++) fprintf(stderr, "%d ", got[i]);
+                fprintf(stderr, "want=");
+                for (int i = 0; i < k; i++) fprintf(stderr, "%d ", ref[i]);
+                fprintf(stderr, "\n");
+            }
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "TOP_K: %d row mismatches\n", bad); return 1; }
+    printf("TOP_K: ok (%lld rows, k=%d, ne0=%lld)\n", (long long) ne1, k, (long long) ne0);
+    return 0;
+}
+
+// TOP_K at vocab-scale shape — confirms the SDK doesn't choke at n_vocab.
+static int test_top_k_vocab(ggml_backend_t gcu) {
+    const int64_t ne0 = 32000;
+    const int     k   = 64;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0);
+    ggml_tensor * c = ggml_top_k(ctx, a, k);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "TOP_K_VOCAB: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>   ha((size_t) ne0);
+    std::vector<int32_t> hc((size_t) k);
+    fill_random_f32(ha.data(), ha.size(), 412);
+
+    std::vector<int32_t> idx((size_t) ne0);
+    for (int64_t i = 0; i < ne0; i++) idx[i] = (int32_t) i;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                      [&](int32_t a_, int32_t b_) { return ha[a_] > ha[b_]; });
+    std::vector<int32_t> ref(idx.begin(), idx.begin() + k);
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "TOP_K_VOCAB: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(int32_t));
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+
+    std::sort(ref.begin(), ref.end());
+    std::sort(hc.begin(), hc.end());
+    if (ref != hc) {
+        fprintf(stderr, "TOP_K_VOCAB: set mismatch (k=%d, n=%lld)\n", k, (long long) ne0);
+        return 1;
+    }
+    printf("TOP_K_VOCAB: ok (n=%lld, k=%d)\n", (long long) ne0, k);
+    return 0;
+}
+
+// ARGSORT. Returns I32 indices that sort each innermost row.
+// Random F32 makes ties statistically negligible at the chosen sizes.
+static int test_argsort(ggml_backend_t gcu) {
+    const int64_t ne0 = 128;
+    const int64_t ne1 = 8;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+    ggml_tensor * cdes = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
+    ggml_tensor * casc = ggml_argsort(ctx, a, GGML_SORT_ORDER_ASC);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ARGSORT: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>   ha((size_t) ne0 * ne1);
+    std::vector<int32_t> hcdes((size_t) ne0 * ne1);
+    std::vector<int32_t> hcasc((size_t) ne0 * ne1);
+    fill_random_f32(ha.data(), ha.size(), 421);
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, cdes);
+    ggml_build_forward_expand(graph, casc);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ARGSORT: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(cdes, hcdes.data(), 0, hcdes.size() * sizeof(int32_t));
+    ggml_backend_tensor_get(casc, hcasc.data(), 0, hcasc.size() * sizeof(int32_t));
+
+    int bad = 0;
+    for (int64_t r = 0; r < ne1; r++) {
+        const float * row = ha.data() + (size_t) r * ne0;
+        const int32_t * gd = hcdes.data() + (size_t) r * ne0;
+        const int32_t * ga = hcasc.data() + (size_t) r * ne0;
+
+        // Verify each output is a permutation of [0..ne0) and respects the
+        // requested order.
+        std::vector<int32_t> seen_d((size_t) ne0, 0), seen_a((size_t) ne0, 0);
+        for (int64_t i = 0; i < ne0; i++) {
+            if (gd[i] < 0 || gd[i] >= ne0 || ga[i] < 0 || ga[i] >= ne0) { bad++; break; }
+            seen_d[gd[i]]++; seen_a[ga[i]]++;
+        }
+        for (int64_t i = 0; i < ne0; i++) {
+            if (seen_d[i] != 1 || seen_a[i] != 1) { bad++; break; }
+        }
+        for (int64_t i = 1; i < ne0; i++) {
+            if (row[gd[i-1]] < row[gd[i]]) { bad++; break; }   // descending
+            if (row[ga[i-1]] > row[ga[i]]) { bad++; break; }   // ascending
+        }
+        if (bad && bad < 4) {
+            fprintf(stderr, "ARGSORT: row=%lld broke order/permutation\n", (long long) r);
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ARGSORT: %d failures\n", bad); return 1; }
+    printf("ARGSORT: ok (%lld rows of %lld, ASC + DESC)\n", (long long) ne1, (long long) ne0);
+    return 0;
+}
+
+// ARGSORT at vocab-scale shape — exercises sample-time argsort path.
+static int test_argsort_vocab(ggml_backend_t gcu) {
+    const int64_t ne0 = 32000;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0);
+    ggml_tensor * c = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ARGSORT_VOCAB: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>   ha((size_t) ne0);
+    std::vector<int32_t> hc((size_t) ne0);
+    fill_random_f32(ha.data(), ha.size(), 422);
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ARGSORT_VOCAB: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(int32_t));
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+
+    // Spot-check: argmax of ha should equal hc[0] (descending sort).
+    int32_t expected = 0;
+    for (int64_t i = 1; i < ne0; i++) if (ha[i] > ha[expected]) expected = (int32_t) i;
+    if (hc[0] != expected) {
+        fprintf(stderr, "ARGSORT_VOCAB: top idx got=%d want=%d\n", hc[0], expected);
+        return 1;
+    }
+    // Verify monotonic descending.
+    for (int64_t i = 1; i < ne0; i++) {
+        if (ha[hc[i-1]] < ha[hc[i]]) {
+            fprintf(stderr, "ARGSORT_VOCAB: order broken at i=%lld\n", (long long) i);
+            return 1;
+        }
+    }
+    printf("ARGSORT_VOCAB: ok (n=%lld, top=%d)\n", (long long) ne0, hc[0]);
+    return 0;
+}
+
+// ARGMAX with F16 input. Reference computed from the same lossy values
+// the device sees, so we can compare indices exactly.
+static int test_argmax_f16(ggml_backend_t gcu) {
+    const int64_t ne0 = 256;
+    const int64_t ne1 = 32;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0, ne1);
+    ggml_tensor * c = ggml_argmax(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "ARGMAX_F16: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float>       ha_f32((size_t) ne0 * ne1);
+    std::vector<ggml_fp16_t> ha((size_t) ne0 * ne1);
+    std::vector<int32_t>     hc((size_t) ne1);
+    fill_random_f32(ha_f32.data(), ha_f32.size(), 431);
+    ggml_fp32_to_fp16_row(ha_f32.data(), ha.data(), ha.size());
+
+    std::vector<int32_t> expected((size_t) ne1);
+    for (int64_t r = 0; r < ne1; r++) {
+        const ggml_fp16_t * row = ha.data() + (size_t) r * ne0;
+        int32_t best = 0;
+        float bv = ggml_fp16_to_fp32(row[0]);
+        for (int64_t i = 1; i < ne0; i++) {
+            const float v = ggml_fp16_to_fp32(row[i]);
+            if (v > bv) { bv = v; best = (int32_t) i; }
+        }
+        expected[r] = best;
+    }
+
+    ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(ggml_fp16_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ARGMAX_F16: compute failed\n"); ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, hc.size() * sizeof(int32_t));
+
+    int bad = 0;
+    for (int64_t r = 0; r < ne1; r++) {
+        if (hc[r] != expected[r]) {
+            if (bad < 3) fprintf(stderr, "ARGMAX_F16: row=%lld got=%d want=%d\n",
+                                 (long long) r, hc[r], expected[r]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "ARGMAX_F16: %d mismatches\n", bad); return 1; }
+    printf("ARGMAX_F16: ok (%lld rows of %lld)\n", (long long) ne1, (long long) ne0);
+    return 0;
+}
+
 // Numerical-equality test for the async H<->D path. Builds an
 // (a + b) * c chain on GCU; populates the inputs via
 // ggml_backend_tensor_set_async, runs graph_compute, reads back via
@@ -3076,6 +3458,13 @@ int main() {
     rc |= test_moe_gate_up_geglu(gcu);
     rc |= test_flash_attn_ext_small(gcu);
     rc |= test_flash_attn_ext_decode(gcu);
+    rc |= test_argmax(gcu);
+    rc |= test_argmax_f16(gcu);
+    rc |= test_argmax_vocab(gcu);
+    rc |= test_top_k(gcu);
+    rc |= test_top_k_vocab(gcu);
+    rc |= test_argsort(gcu);
+    rc |= test_argsort_vocab(gcu);
     rc |= test_async_overlap(gcu);
 
     const bool bench_ran = (rc == 0 && getenv("GCU_BENCH") != nullptr);
