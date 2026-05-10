@@ -1547,6 +1547,105 @@ static int test_mean(ggml_backend_t gcu) {
 }
 #endif  // SUM_ROWS / MEAN gated out
 
+// Tranche D5: CUMSUM. Cumulative sum along innermost dim. F32 only.
+static int test_cumsum(ggml_backend_t gcu) {
+    const int64_t M = 256, N = 32;
+    const size_t  n = (size_t) M * N;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_cumsum(ctx, a);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "CUMSUM: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 92);
+    for (int64_t r = 0; r < N; r++) {
+        double s = 0.0;
+        for (int64_t k = 0; k < M; k++) {
+            s += ha[r * M + k];
+            expected[r * M + k] = (float) s;
+        }
+    }
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "CUMSUM: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!close_enough(hc[i], expected[i], 1e-3f, 1e-4f)) {
+            if (bad < 5) fprintf(stderr, "CUMSUM: idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "CUMSUM: %d mismatches\n", bad); return 1; }
+    printf("CUMSUM: ok (%zu elements)\n", n);
+    return 0;
+}
+
+// Tranche D5: CLAMP. ggml_clamp returns a view of the input, so the
+// "result" tensor shares a's data buffer. We read back from `c`'s
+// buffer (== a's after compute).
+static int test_clamp(ggml_backend_t gcu) {
+    const int64_t M = 1024, N = 64;
+    const size_t  n = (size_t) M * N;
+    const float clamp_min = -0.25f;
+    const float clamp_max = +0.25f;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M, N);
+    ggml_tensor * c = ggml_clamp(ctx, a, clamp_min, clamp_max);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "CLAMP: alloc failed\n"); ggml_free(ctx); return 1; }
+
+    std::vector<float> ha(n), hc(n), expected(n);
+    fill_random_f32(ha.data(), n, 91);
+    for (size_t i = 0; i < n; i++) {
+        float v = ha[i];
+        if (v < clamp_min) v = clamp_min;
+        if (v > clamp_max) v = clamp_max;
+        expected[i] = v;
+    }
+    ggml_backend_tensor_set(a, ha.data(), 0, n * sizeof(float));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, c);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "CLAMP: compute failed\n");
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(c, hc.data(), 0, n * sizeof(float));
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!close_enough(hc[i], expected[i], 1e-5f, 1e-5f)) {
+            if (bad < 5) fprintf(stderr, "CLAMP: idx=%zu got=%f want=%f\n", i, hc[i], expected[i]);
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "CLAMP: %d mismatches\n", bad); return 1; }
+    printf("CLAMP: ok (%zu elements)\n", n);
+    return 0;
+}
+
 // Tranche D2 follow-up: broadcast DIV at MoE-decode shape:
 // [n_expert_used, n_tokens] / [1, n_tokens]. Mirrors the Gemma 4 ffn
 // weight-normalization div.
@@ -3889,6 +3988,8 @@ int main() {
     rc |= test_div_moe_decode(gcu);
     rc |= test_add1(gcu);
     rc |= test_sum(gcu);
+    rc |= test_clamp(gcu);
+    rc |= test_cumsum(gcu);
     rc |= test_scale(gcu);
     rc |= test_get_rows(gcu);
     rc |= test_set_rows(gcu);

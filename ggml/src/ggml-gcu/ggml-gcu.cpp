@@ -2455,6 +2455,70 @@ static bool gcu_op_sum(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
 // supports_op so the scheduler keeps them on CPU. Gemma 4's only
 // SUM_ROWS use site is the MoE weight normalization (CPU-fast).
 
+// Tranche D5: CUMSUM. F32 only (matches ggml's CPU forward). Reduces
+// along ggml's innermost dim (ne[0]); output has same shape as input.
+// Use the int32_t-dim overload of topsatenCumsum.
+static bool gcu_op_cumsum(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+
+    gcu_tensor_dims din, dout;
+    topsatenTensor in_t  = make_topsaten_tensor(src, din);
+    topsatenTensor out_t = make_topsaten_tensor(dst, dout);
+
+    int rank = ggml_n_dims(src); if (rank < 1) rank = 1;
+    int32_t dim = (int32_t)(rank - 1);  // PyTorch last dim == ggml ne[0]
+    TOPSATEN_CHECK(topsatenCumsum(out_t, in_t, dim,
+                                  TOPSATEN_DATA_FP32, ctx->compute_stream));
+    return true;
+}
+
+// Tranche D5: CLAMP. ggml_clamp returns a view of `a`, so dst always
+// aliases src — copy src to a scratch buffer and clamp into dst (==a).
+// op_params holds [min, max] as F32. Used by Gemma 4 MoE weight
+// normalization to clamp weights_sum away from zero before DIV.
+static bool gcu_op_clamp(ggml_backend_gcu_context * ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(dst->type == src->type);
+
+    float clamp_min, clamp_max;
+    memcpy(&clamp_min, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&clamp_max, (const float *) dst->op_params + 1, sizeof(float));
+
+    void * scratch = nullptr;
+    size_t scratch_bytes = 0;
+    void * in_data = src->data;
+    if (gcu_dst_aliases_src0_at_runtime(dst)) {
+        scratch_bytes = ggml_nbytes(src);
+        scratch       = ctx->pool.alloc(scratch_bytes);
+        TOPS_CHECK(topsMemcpyAsync(scratch, in_data, scratch_bytes,
+                                   topsMemcpyDeviceToDevice, ctx->compute_stream));
+        in_data = scratch;
+    }
+
+    gcu_tensor_dims dout, din;
+    topsatenTensor out_t = make_topsaten_tensor(dst, dout);
+    {
+        const size_t bpe = ggml_type_size(src->type);
+        int rank = ggml_n_dims(src); if (rank < 1) rank = 1;
+        for (int i = 0; i < rank; i++) {
+            din.dims[i] = src->ne[rank - 1 - i];
+            din.strs[i] = src->nb[rank - 1 - i] / (int64_t) bpe;
+        }
+        topsatenSize_t shape (din.dims, rank);
+        topsatenSize_t stride(din.strs, rank);
+        topsatenTensor in_t(shape, stride, ggml_to_topsaten_dtype(src->type), in_data);
+
+        topsatenScalar_t lo, hi;
+        lo.dtype = TOPSATEN_DATA_FP32; lo.fval = clamp_min;
+        hi.dtype = TOPSATEN_DATA_FP32; hi.fval = clamp_max;
+        TOPSATEN_CHECK(topsatenClamp(out_t, in_t, lo, hi, ctx->compute_stream));
+    }
+    gcu_release_scratch(ctx, scratch, scratch_bytes);
+    return true;
+}
+
 // MVP-5b: sampling helper ops (ARGMAX / TOP_K / ARGSORT).
 //
 // These reduce / sort along ggml's innermost dim (ne[0]) and produce I32
@@ -2652,6 +2716,10 @@ static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node)
             return gcu_op_cos(ctx, node);
         case GGML_OP_SUM:
             return gcu_op_sum(ctx, node);
+        case GGML_OP_CLAMP:
+            return gcu_op_clamp(ctx, node);
+        case GGML_OP_CUMSUM:
+            return gcu_op_cumsum(ctx, node);
         case GGML_OP_UNARY: {
             const enum ggml_unary_op uop = ggml_get_unary_op(node);
             switch (uop) {
@@ -3086,6 +3154,32 @@ static bool ggml_backend_gcu_device_supports_op(ggml_backend_dev_t /*dev*/, cons
             if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
             return true;
         }
+        case GGML_OP_CLAMP: {
+            // ggml's CPU forward supports F32 and F16; we match both.
+            // op_params: [min, max] F32. min == -INFINITY or max ==
+            // INFINITY are valid (one-sided clamp).
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (!gcu_dtype_supported(src->type)) return false;
+            if (src->type != op->type) return false;
+            // ggml_clamp returns a view of src, so dst always aliases src
+            // and ggml_is_contiguous(op) tracks src's contiguity. Require
+            // a contiguous src; the handler then materializes a scratch
+            // copy and clamps into dst.
+            if (!ggml_is_contiguous(src)) return false;
+            return true;
+        }
+        case GGML_OP_CUMSUM: {
+            // F32-only on CPU; we match.
+            const ggml_tensor * src = op->src[0];
+            if (!src) return false;
+            if (src->type != GGML_TYPE_F32) return false;
+            if (op->type  != GGML_TYPE_F32) return false;
+            if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+            return true;
+        }
+        // GGML_OP_COUNT_EQUAL: I32 inputs, I64 scalar output. Rare op
+        // (training paths only); not implemented — falls back to CPU.
         case GGML_OP_ROPE: {
             // MVP-3c: F32 + F16 supported. F16 builds the cos/sin table in
             // F16 to satisfy the SDK's same-dtype requirement
