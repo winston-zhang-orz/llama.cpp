@@ -2250,6 +2250,88 @@ static int test_set_rows(ggml_backend_t gcu) {
     return 0;
 }
 
+// SET_ROWS F16 dst, F32 src (the KV cache write pattern). Parametrised by
+// shape so we can run both an L1 small case and an L3 KV-cache-shaped case.
+//
+// MVP-6: the handler casts F32 src -> F16 via topsatenTo, then writes via
+// topsatenIndexPut after casting I64 indices to I32 on-stream.
+static int test_set_rows_f16(ggml_backend_t gcu,
+                             int64_t cols, int64_t n_dst, int64_t n_src,
+                             const char * label) {
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, cols, n_dst);
+    ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, n_src);
+    ggml_tensor * idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, n_src, 1);
+    ggml_tensor * out = ggml_set_rows(ctx, dst, src, idx);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "%s: alloc failed\n", label); ggml_free(ctx); return 1; }
+
+    std::vector<ggml_fp16_t> h_dst((size_t) cols * n_dst);
+    std::vector<float>       h_src((size_t) cols * n_src);
+    std::vector<int64_t>     h_idx((size_t) n_src);
+    std::vector<ggml_fp16_t> h_out((size_t) cols * n_dst);
+    std::vector<ggml_fp16_t> expected((size_t) cols * n_dst);
+
+    // Random F16 dst (init), random F32 src.
+    {
+        std::vector<float> tmp((size_t) cols * n_dst);
+        fill_random_f32(tmp.data(), tmp.size(), 81);
+        ggml_fp32_to_fp16_row(tmp.data(), h_dst.data(), (int64_t) tmp.size());
+    }
+    fill_random_f32(h_src.data(), h_src.size(), 82);
+
+    // Distinct row indices.
+    std::vector<int64_t> all(n_dst);
+    for (int64_t i = 0; i < n_dst; i++) all[i] = i;
+    std::mt19937 rng(83);
+    std::shuffle(all.begin(), all.end(), rng);
+    for (int64_t i = 0; i < n_src; i++) h_idx[i] = all[i];
+
+    // CPU reference. The destination keeps its existing F16 bits at
+    // un-touched rows; touched rows get F32->F16 of the src row.
+    expected = h_dst;
+    for (int64_t i = 0; i < n_src; i++) {
+        const int64_t r = h_idx[i];
+        ggml_fp32_to_fp16_row(h_src.data() + (size_t) i * cols,
+                              expected.data() + (size_t) r * cols, cols);
+    }
+
+    ggml_backend_tensor_set(dst, h_dst.data(), 0, h_dst.size() * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(src, h_src.data(), 0, h_src.size() * sizeof(float));
+    ggml_backend_tensor_set(idx, h_idx.data(), 0, h_idx.size() * sizeof(int64_t));
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: compute failed\n", label);
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_tensor_get(dst, h_out.data(), 0, h_out.size() * sizeof(ggml_fp16_t));
+
+    int bad = 0;
+    for (size_t i = 0; i < h_out.size(); i++) {
+        if (h_out[i] != expected[i]) {
+            // Both went through F32->F16 of the same source bits; bit-equality holds.
+            if (bad < 5) {
+                fprintf(stderr, "%s: mismatch idx=%zu got=0x%04x want=0x%04x\n",
+                        label, i, h_out[i], expected[i]);
+            }
+            bad++;
+        }
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    if (bad) { fprintf(stderr, "%s: %d mismatches\n", label, bad); return 1; }
+    printf("%s: ok (%zu elements)\n", label, h_out.size());
+    return 0;
+}
+
 // CONCAT along innermost dim. Two F32 2D tensors with matching outer
 // dim, concatenated along the innermost axis (typical KV-cache-style
 // assembly: append new tokens' values to existing rows).
@@ -5672,6 +5754,10 @@ int main() {
     rc |= test_scale(gcu);
     rc |= test_get_rows(gcu);
     rc |= test_set_rows(gcu);
+    // MVP-6: F16-dst SET_ROWS at L1 (small) and L3 (KV cache shape).
+    rc |= test_set_rows_f16(gcu, 128,  16,  8, "SET_ROWS_F16 (L1, [16,128] <- [8,128])");
+    rc |= test_set_rows_f16(gcu, 128, 4096, 64,
+                            "SET_ROWS_F16 (L3, Llama 1B KV cache [4096,128] <- [64,128])");
     rc |= test_concat(gcu);
     rc |= test_cpy(gcu);
     rc |= test_mul_mat(gcu);
