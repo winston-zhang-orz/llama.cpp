@@ -19,20 +19,7 @@ if (NOT EXISTS "${TOPS_INSTALL_DIR}/include/gcu/topsaten/topsaten.h")
         "Install the tops-sdk and topsaten packages, or pass -DTOPS_INSTALL_DIR=...")
 endif()
 
-# MVP-5c file split: the backend is split across 9 TUs that mirror CANN's
-# directory layout. Use an explicit list rather than file(GLOB) so adding /
-# moving an op-family file is a deliberate edit (and so out-of-tree
-# scratch sources in this dir don't accidentally get built).
-set(GGML_SOURCES_GCU
-    ggml-gcu.cpp
-    common.cpp
-    gcu_pool.cpp
-    gcu_buffer.cpp
-    gcu_op_elementwise.cpp
-    gcu_op_norm.cpp
-    gcu_op_matmul.cpp
-    gcu_op_attn.cpp
-    gcu_op_misc.cpp)
+file(GLOB GGML_SOURCES_GCU "*.cpp")
 
 ggml_add_backend_library(ggml-gcu ${GGML_SOURCES_GCU})
 
