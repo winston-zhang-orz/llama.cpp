@@ -582,7 +582,11 @@ static void ggml_backend_gcu_synchronize(ggml_backend_t backend) {
 // further down in the file.
 static bool gcu_compute_node(ggml_backend_gcu_context * ctx, ggml_tensor * node);
 
+#ifdef GGML_GCU_OLLAMA_API
+static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph, int /*batch_size*/) {
+#else
 static enum ggml_status ggml_backend_gcu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+#endif
     auto * ctx = (ggml_backend_gcu_context *) backend->context;
     TOPS_CHECK(topsSetDevice(ctx->device));
 
@@ -3158,6 +3162,19 @@ static void ggml_backend_gcu_device_get_props(ggml_backend_dev_t dev, ggml_backe
         /* .buffer_from_host_ptr = */ false,
         /* .events               = */ false,
     };
+#ifdef GGML_GCU_OLLAMA_API
+    // Ollama-patched ggml_backend_dev_props fields (patches 0015, 0018, 0024).
+    // Populate so Ollama's bootstrap discovery (server/sched.go) sees us as a
+    // first-class library and can dedup by id.
+    auto * d = (ggml_backend_gcu_device_context *) dev->context;
+    props->id            = d->name.c_str();      // human-readable: "GCU0"
+    props->library       = GGML_GCU_NAME;        // "GCU" — drives Library=="GCU" Go-side branches
+    props->driver_major  = 0;
+    props->driver_minor  = 0;
+    props->compute_major = 0;
+    props->compute_minor = 0;
+    props->integrated    = 0;
+#endif
 }
 
 static ggml_backend_t ggml_backend_gcu_device_init_backend(ggml_backend_dev_t dev, const char * /*params*/) {
