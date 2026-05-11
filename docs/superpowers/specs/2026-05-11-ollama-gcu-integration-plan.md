@@ -14,7 +14,7 @@ Scope: read-only investigation; no code changes.
 
 ### 2.1 Mechanism and paths
 
-- **Mechanism**: rsync from a git-tracked clone, not subtree/submodule. See [`Makefile.sync`](https://github.com/ollama/ollama/blob/main/Makefile.sync) (lines 1-58 of `/tmp/ollama-research/ollama/Makefile.sync`).
+- **Mechanism**: rsync from a git-tracked clone, not subtree/submodule. See [`Makefile.sync`](https://github.com/ollama/ollama/blob/main/Makefile.sync) (lines 1-58 of `~/github/ollama/Makefile.sync`).
   - `llama/vendor/` is a real git clone of `https://github.com/ggml-org/llama.cpp.git`.
   - `make sync` rsyncs into two destinations:
     - `llama/llama.cpp/` ← LICENSE + filtered files (the C++ inference library used by the `llamarunner`).
@@ -24,7 +24,7 @@ Scope: read-only investigation; no code changes.
 
 ### 2.2 Patches inventory and conflict surface
 
-36 patches in `/tmp/ollama-research/ollama/llama/patches/`. Categorised:
+36 patches in `~/github/ollama/llama/patches/`. Categorised:
 
 **Touches `ggml/src/ggml-backend-reg.cpp` (collision risk for our GCU additions)**
 - `0007-sort-devices-by-score.patch` — refactors `devices` from `vector<dev_t>` to `vector<pair<dev_t, int>>`. Conflicts with our 7-line GCU additions in the same file (one `#include` block, one `register_backend(...)` block). **Trivially mergeable** by hand.
@@ -58,15 +58,15 @@ Scope: read-only investigation; no code changes.
 
 ### 3.1 The build flow
 
-1. **`/tmp/ollama-research/ollama/CMakeLists.txt`** is the umbrella CMake. It:
+1. **`~/github/ollama/CMakeLists.txt`** is the umbrella CMake. It:
    - Sets `GGML_BACKEND_DL=ON` and `GGML_SCHED_MAX_COPIES=4` (lines 33-38).
    - Always builds CPU (line 87: `add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/ml/backend/ggml/ggml/src)`).
    - Then `check_language(CUDA)` / `find_package(hip)` / `find_package(Vulkan)` gate optional backends (lines 111-195) and explicitly `add_subdirectory(...)` each one.
    - Each backend gets its own `install(TARGETS ggml-X ...)` block keyed by `COMPONENT` (CPU/CUDA/HIP/Vulkan/MLX).
 
-2. **`/tmp/ollama-research/ollama/CMakePresets.json`** defines presets that map `(backend, version) → OLLAMA_RUNNER_DIR`. E.g. CUDA 12 → `cuda_v12`, ROCm → `rocm`, Vulkan → `vulkan`. The runner dir becomes the subdirectory under `lib/ollama/` where the `.so` lives.
+2. **`~/github/ollama/CMakePresets.json`** defines presets that map `(backend, version) → OLLAMA_RUNNER_DIR`. E.g. CUDA 12 → `cuda_v12`, ROCm → `rocm`, Vulkan → `vulkan`. The runner dir becomes the subdirectory under `lib/ollama/` where the `.so` lives.
 
-3. **`/tmp/ollama-research/ollama/ml/backend/ggml/ggml/src/CMakeLists.txt`** has `ggml_add_backend(<name>)` macro (lines 296-307) and the call list (lines 354, 431-444). For backend `X` it does `add_subdirectory(ggml-x)` if `GGML_X=ON`. **Our fork already registers `ggml_add_backend(GCU)` indirectly via our own `ggml/CMakeLists.txt` patch — once vendored, the line just needs to exist in this file at line ~445.**
+3. **`~/github/ollama/ml/backend/ggml/ggml/src/CMakeLists.txt`** has `ggml_add_backend(<name>)` macro (lines 296-307) and the call list (lines 354, 431-444). For backend `X` it does `add_subdirectory(ggml-x)` if `GGML_X=ON`. **Our fork already registers `ggml_add_backend(GCU)` indirectly via our own `ggml/CMakeLists.txt` patch — once vendored, the line just needs to exist in this file at line ~445.**
 
 4. **Build invocation**: `scripts/build_windows.ps1` and `Dockerfile` call `cmake -B build/cuda_v12 --preset "CUDA 12"` then `cmake --build build/cuda_v12 --target ggml-cuda --config Release`. Linux uses `Dockerfile` via `docker buildx`; per-flavor flavors set via `--build-arg FLAVOR=rocm`.
 
@@ -264,7 +264,7 @@ EOF
 
 ### 8.3 Licensing posture
 
-- **Ollama**: MIT (`/tmp/ollama-research/ollama/LICENSE`).
+- **Ollama**: MIT (`~/github/ollama/LICENSE`).
 - **Our fork**: MIT (inherits llama.cpp).
 - **Topsrider SDK** (`/opt/tops/lib/libtopsrt.so`): licensed by Enflame, redistribution terms TBD. **Compatibility implication**: we cannot bundle `libtopsrt.so` into the Ollama tarball. The runner will dlopen it at runtime from `/opt/tops/lib`, requiring `LD_LIBRARY_PATH` or rpath. The CMake `install(TARGETS ggml-gcu RUNTIME_DEPENDENCIES ... DIRECTORIES /opt/tops/lib ...)` should be replaced with a doc note ("install topsrider SDK separately").
 
