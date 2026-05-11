@@ -3892,3 +3892,13 @@ ggml_backend_reg_t ggml_backend_gcu_reg(void) {
 }
 
 } // extern "C"
+
+// When building as a dl module (GGML_BACKEND_DL, e.g. inside Ollama), export
+// the standard discovery entry points. Score 50 puts us at the CUDA tier of
+// patch 0007's stable_sort.
+static int ggml_backend_gcu_score(void) {
+    return ggml_backend_gcu_get_device_count() > 0 ? 50 : 0;
+}
+
+GGML_BACKEND_DL_IMPL(ggml_backend_gcu_reg)
+GGML_BACKEND_DL_SCORE_IMPL(ggml_backend_gcu_score)
