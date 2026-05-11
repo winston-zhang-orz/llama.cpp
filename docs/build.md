@@ -499,6 +499,8 @@ For detailed info, such as model/device supports, CANN install, please refer to 
 
 llama.cpp can run on Enflame GCU devices (e.g. S60) via the `ggml-gcu` backend. The backend wraps Enflame's high-level operator library (`topsaten`) and the device runtime (`topsrt`).
 
+The backend lives at `ggml/src/ggml-gcu/`, organized in the same shape as CANN: `common.{h,cpp}` for shared types and helpers, `gcu_pool.{h,cpp}` for the device memory pool, `gcu_buffer.{h,cpp}` for the ggml buffer interface, `gcu_ops.h` for op-handler declarations, and one `gcu_op_<family>.cpp` per op family (`elementwise`, `norm`, `matmul`, `attn`, `misc`). `ggml-gcu.cpp` ties them together and hosts the backend / device interface.
+
 ### Prerequisites
 
 Install Enflame's TopsRider SDK packages on the build host (Debian/Ubuntu):
@@ -527,7 +529,8 @@ If the SDK is installed to a non-standard path, override with `-DTOPS_INSTALL_DI
 
 ```bash
 ./build/bin/llama-cli --list-devices         # GCU0 should appear with its memory size
-./build/bin/test-backend-gcu                 # smoke test: ADD + MUL_MAT + RMS_NORM + SOFT_MAX + ROPE + SILU + mixed-dtype MUL_MAT vs CPU
+./build/bin/test-backend-gcu                 # smoke suite (90+ sub-tests covering every dispatched op + F32/F16/BF16 dtype variants + Q-weight roundtrip + async H<->D overlap + real-model shape coverage)
+GCU_BENCH=1 ./build/bin/test-backend-gcu     # opt-in: also print per-op micro-bench at decode shapes
 ./build/bin/test-backend-ops -b GCU0 -o ADD  # exercises ADD across many shapes/dtypes
 
 # Real model (KV cache stays on CPU via -nkvo):
@@ -609,7 +612,7 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 - Activations: `SILU`, `GELU`, `GELU_QUICK`, `RELU`, `TANH`, `SIGMOID`, `HARDSWISH`, `HARDSIGMOID` (all via `GGML_OP_UNARY`)
 - Gated activations: `GEGLU`, `GEGLU_QUICK`, `SWIGLU`, `REGLU` (all via `GGML_OP_GLU`; both two-source and split forms)
 - Normalization: `NORM` (LayerNorm without affine), `RMS_NORM`
-- Position encoding: `ROPE` (NORMAL mode 0 + NEOX mode 2; no YARN, no MROPE/VISION/IMROPE; F32, F16, and BF16)
+- Position encoding: `ROPE` (NORMAL mode 0 + NEOX mode 2; `freq_factors` (proportional rope) and partial rotation (`n_dims < head_dim`) supported as of MVP-5b; MROPE/VISION/IMROPE scaffolded but gated behind `GGML_GCU_ENABLE_MROPE` env var pending SDK position-layout diagnostic; no YARN (`ext_factor != 0`); F32, F16, and BF16)
 - Reduction: `SOFT_MAX` (with optional F16/F32 mask, `max_bias = 0`, no softmax sinks; F32/F16/BF16 input)
 - Linear: `MUL_MAT` (F32×F32→F32 fast path; F16-weight × {F16,F32} → {F16,F32} via cast; BF16-weight × {BF16,F16,F32} → {BF16,F16,F32} via cast; Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K / Q3_K weights via F16 dequant-on-load)
 - MoE dispatch: `MUL_MAT_ID` (same dtype matrix as `MUL_MAT`; per-(token, expert-slot) `topsatenLinear` loop; low-precision-weight path casts F32 input once for the whole sweep). Required for Gemma 4 26B A4B and other MoE models.
@@ -622,7 +625,7 @@ Use F16 GGUFs for the best perf. Q4 GGUFs work but currently lose to highly-tune
 - Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, and Q3_K weight tensors are dequantized to F16 at model-load time (one-time host cost) and stored as F16 on GCU (2-5× the on-disk size). MUL_MAT then runs on GCU via the F16 path. Other Q-types (Q2_K, Q5_0, Q5_1, IQ*, etc.) stay on CPU. Native quantized matmul via `topsatenLinearQuant` is a future MVP that would avoid the F16 expansion and likely match Q4 CPU performance.
 - KV cache is designed to stay on CPU. `SET_ROWS` to F16 destinations (the cache dtype) is refused on GCU. Pass `-nkvo` (`--no-kv-offload`) when offloading layers to GCU; without it llama.cpp tries to allocate the cache on GCU and the scheduler aborts at graph_reserve. With `-nkvo`, real Q4 / F16 models load and run on `--device GCU0` (Q4 weights and KV stay CPU; activation math runs on GCU). An MVP-3b probe (manual D2D memcpy bypassing `topsatenIndexPut`) was 2-5× slower than `-nkvo` because per-call sync H2D of indices drains the stream — native cache offload needs an async index transfer or a custom GCU scatter kernel.
 - BF16 supported on core ops as of MVP-5a (see operator coverage above). End-to-end verified on Llama 3.2 1B BF16 (`unsloth/Llama-3.2-1B-Instruct-GGUF`): `llama-completion --temp 0` produces bit-identical output to CPU. Bench numbers in the coverage line.
-- Only `ROPE` mode 0 is implemented; YARN / NEOX / MROPE go to CPU.
+- `ROPE` supports NORMAL + NEOX + `freq_factors` + partial rotation (see operator coverage). YARN (`ext_factor != 0`) goes to CPU. MROPE/VISION/IMROPE handlers exist but are gated behind `GGML_GCU_ENABLE_MROPE`; an SDK position-layout discrepancy with `topsvllmMRotaryEmbedding` is documented as a TODO at the gate and remains an open diagnostic.
 - `SOFT_MAX` with `max_bias != 0` (alibi) and `softmax sinks` (a non-null `op->src[2]`) go to CPU.
 - Single device, single stream. Pinned host memory (`topsHostMalloc`) is enabled and used by the `-nkvo` KV cache. On Llama 3.2 1B Q4_K_M (`--device GCU0 -nkvo 1`, r=5):
 
