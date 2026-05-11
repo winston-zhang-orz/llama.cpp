@@ -3777,7 +3777,14 @@ extern "C" {
 
 int32_t ggml_backend_gcu_get_device_count(void) {
     int count = 0;
-    TOPS_CHECK(topsGetDeviceCount(&count));
+    // Don't abort if topsrt isn't available — this function is called from
+    // ggml_backend_score(), which Ollama invokes during candidate discovery
+    // on hosts that may not have GCU at all. Returning 0 makes load_best
+    // skip our backend cleanly.
+    topsError_t err = topsGetDeviceCount(&count);
+    if (err != topsSuccess) {
+        return 0;
+    }
     return count;
 }
 
