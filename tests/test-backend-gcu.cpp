@@ -5707,6 +5707,81 @@ static int test_flash_attn_ext_decode(ggml_backend_t gcu) {
     return test_flash_attn_ext_shape(gcu, 128, 16, 8, 128, 1, 1, "FLASH_ATTN_EXT_DECODE_GQA", 902);
 }
 
+// Regression guard for the deferred-free OOM that crashed
+// `test-backend-ops perf -b GCU0 -o FLASH_ATTN_EXT`. The perf harness
+// duplicates a single FA op `target_flops / op_flops(out)` times into one
+// graph and then runs `ggml_backend_graph_compute` on it. For the small-decode
+// shape (kv=4096, head_dim=64, nh=8, nr=1, n_q=1) `op_flops` is in the low
+// millions, so n_runs caps at ~8192 op-copies per graph. With the MVP-4b
+// queued-ops design every per-op scratch (Q/K/V/out_f16/cast_buf) was
+// deferred to end-of-graph, accumulating tens of GiB of outstanding
+// device memory before the drain — far past S60's 41 GiB free pool, and
+// it tripped topsErrorOutOfMemory in `materialize_f16` at line ~135 of
+// ggml-gcu.cpp. The fix bounds deferred bytes per graph_compute and
+// drains mid-graph when the cap is exceeded. This test reproduces the
+// fan-out shape; it crashed at HEAD prior to the fix and passes after.
+static int test_flash_attn_ext_perf_fanout(ggml_backend_t gcu) {
+    const char * label = "FLASH_ATTN_EXT_PERF_FANOUT";
+    const int64_t head_dim  = 64;
+    const int64_t n_head    = 8;
+    const int64_t n_head_kv = 8;
+    const int64_t n_kv      = 4096;
+    const int64_t n_q       = 1;
+    const int64_t n_batch   = 1;
+
+    // 2048 op-copies is enough to drive deferred-scratch past the 1 GiB cap
+    // many times over (per-op scratch ~ 4 MB K + 4 MB V ≈ 8.6 MB, so 2048
+    // copies ≈ 17.6 GiB outstanding without bounding). Stays well under
+    // ggml_graph default node cap.
+    const int n_dup = 2048;
+
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    ggml_init_params p = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(n_dup + 16, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q,  n_head,    n_batch);
+    ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv, n_head_kv, n_batch);
+    ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv, n_head_kv, n_batch);
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+
+    const float scale = 1.0f / std::sqrt((float) head_dim);
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (!buf) { fprintf(stderr, "%s: alloc failed\n", label); ggml_free(ctx); return 1; }
+
+    // Zero-fill all inputs so the result is well-defined and deterministic;
+    // this test is a correctness-of-no-crash check, not a value check.
+    const size_t nq    = (size_t) head_dim * n_q  * n_head    * n_batch;
+    const size_t nkv   = (size_t) head_dim * n_kv * n_head_kv * n_batch;
+    const size_t nmask = (size_t) n_kv * n_q;
+    std::vector<float>       zq(nq, 0.0f);
+    std::vector<ggml_fp16_t> zk(nkv, 0), zv(nkv, 0), zm(nmask, 0);
+    ggml_backend_tensor_set(q,    zq.data(), 0, nq    * sizeof(float));
+    ggml_backend_tensor_set(k,    zk.data(), 0, nkv   * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(v,    zv.data(), 0, nkv   * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(mask, zm.data(), 0, nmask * sizeof(ggml_fp16_t));
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_dup + 16, false);
+    ggml_build_forward_expand(graph, out);
+    // Mirror test-backend-ops perf mode: duplicate the same op node.
+    for (int i = 1; i < n_dup; i++) {
+        ggml_graph_add_node(graph, out);
+    }
+    if (ggml_backend_graph_compute(gcu, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: compute failed\n", label);
+        ggml_backend_buffer_free(buf); ggml_free(ctx); return 1;
+    }
+    ggml_backend_buffer_free(buf); ggml_free(ctx);
+    printf("%s: ok (%d op-copies in one graph_compute)\n", label, n_dup);
+    return 0;
+}
+
 static void bench_all(ggml_backend_t gcu) {
     if (getenv("GCU_BENCH") == nullptr) return;
     printf("---- per-op micro-bench (decode-step shapes; warmup+timed) ----\n");
@@ -5718,6 +5793,400 @@ static void bench_all(ggml_backend_t gcu) {
     bench_mul_mat_f16(gcu);
     bench_mul_mat_q4_k(gcu);
     bench_mul_mat_id_f16(gcu);
+}
+
+// ============================================================
+// GCU_BENCH_TOKEN_GRID: per-op perf parameterized by token length.
+// Opt-in via env: GCU_BENCH_TOKEN_GRID=1 ./test-backend-gcu
+//
+// Sweeps the same family of hot ops covered by bench_all() at a
+// token-length grid {1, 4, 8, 32, 64, 128, 256, 512, 1024, 2048}, so
+// regression tracking at the op level can spot scaling-cliff regressions
+// across the decode↔prefill boundary. Each line is parseable as:
+//   BENCH_GRID op=<name> dtype=<dtype> tokens=<N> mean_ms=<x> std_ms=<y>
+// ============================================================
+
+static const int64_t kBenchTokenGrid[] = {1, 4, 8, 32, 64, 128, 256, 512, 1024, 2048};
+
+static void time_graph_grid(ggml_backend_t gcu, ggml_cgraph * graph,
+                            const char * op, const char * dtype, int64_t tokens) {
+    using clock = std::chrono::steady_clock;
+    const int n_warmup = 2;
+    const int n_iter   = 8;
+    for (int i = 0; i < n_warmup; i++) ggml_backend_graph_compute(gcu, graph);
+    ggml_backend_synchronize(gcu);
+
+    double sum = 0.0, sq = 0.0;
+    for (int i = 0; i < n_iter; i++) {
+        auto t0 = clock::now();
+        ggml_backend_graph_compute(gcu, graph);
+        ggml_backend_synchronize(gcu);
+        auto t1 = clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        sum += ms; sq += ms * ms;
+    }
+    double mean = sum / n_iter;
+    double var  = sq / n_iter - mean * mean;
+    double std  = var > 0 ? std::sqrt(var) : 0.0;
+    printf("BENCH_GRID op=%s dtype=%s tokens=%lld mean_ms=%.4f std_ms=%.4f\n",
+           op, dtype, (long long) tokens, mean, std);
+}
+
+// Common 2D binary elementwise pattern (a, b) -> a OP b, hidden=4096
+static void grid_binary_2d_f32(ggml_backend_t gcu, int64_t tokens,
+                               const char * op_name,
+                               ggml_tensor * (*op_fn)(ggml_context *, ggml_tensor *, ggml_tensor *),
+                               uint32_t seed) {
+    const int64_t H = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, tokens);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, tokens);
+    ggml_tensor * c = op_fn(ctx, a, b);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) H * tokens), hb((size_t) H * tokens);
+        fill_random_f32(ha.data(), ha.size(), seed);
+        fill_random_f32(hb.data(), hb.size(), seed + 1);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_backend_tensor_set(b, hb.data(), 0, hb.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, op_name, "F32", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// Common 2D unary elementwise pattern: a -> OP(a), hidden=4096
+typedef ggml_tensor * (*unary_op_fn)(ggml_context *, ggml_tensor *);
+static void grid_unary_2d_f32(ggml_backend_t gcu, int64_t tokens,
+                              const char * op_name, unary_op_fn op_fn, uint32_t seed) {
+    const int64_t H = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, tokens);
+    ggml_tensor * c = op_fn(ctx, a);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) H * tokens);
+        fill_random_f32(ha.data(), ha.size(), seed);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, op_name, "F32", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+static void grid_scale_f32(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t H = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, tokens);
+    ggml_tensor * c = ggml_scale(ctx, a, 0.125f);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) H * tokens);
+        fill_random_f32(ha.data(), ha.size(), 221);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "SCALE", "F32", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+static void grid_rms_norm_f32(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t H = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, tokens);
+    ggml_tensor * c = ggml_rms_norm(ctx, a, 1e-5f);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) H * tokens);
+        fill_random_f32(ha.data(), ha.size(), 231);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "RMS_NORM", "F32", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+static void grid_norm_f32(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t H = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, tokens);
+    ggml_tensor * c = ggml_norm(ctx, a, 1e-5f);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) H * tokens);
+        fill_random_f32(ha.data(), ha.size(), 241);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "NORM", "F32", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// SOFT_MAX [n_kv=128, n_head=32, n_q=tokens]
+static void grid_softmax_f32(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t n_kv = 128, n_head = 32;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_kv, n_head, tokens);
+    ggml_tensor * c = ggml_soft_max(ctx, a);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) n_kv * n_head * tokens);
+        fill_random_f32(ha.data(), ha.size(), 251);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "SOFT_MAX", "F32", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// ROPE NEOX [head_dim=128, n_head=32, n_q=tokens]
+static void grid_rope_f32(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t head_dim = 128, n_head = 32;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, tokens);
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+    ggml_tensor * c   = ggml_rope(ctx, a, pos, head_dim, /*mode=*/2);  // NEOX
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float>   ha((size_t) head_dim * n_head * tokens);
+        std::vector<int32_t> hp(tokens);
+        fill_random_f32(ha.data(), ha.size(), 261);
+        for (int64_t i = 0; i < tokens; i++) hp[i] = (int32_t) i;
+        ggml_backend_tensor_set(a,   ha.data(), 0, ha.size() * sizeof(float));
+        ggml_backend_tensor_set(pos, hp.data(), 0, hp.size() * sizeof(int32_t));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "ROPE", "F32-NEOX", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// CPY F32 -> F16 [hidden=4096, tokens]
+static void grid_cpy_f32_f16(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t H = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, tokens);
+    ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, H, tokens);
+    ggml_tensor * c   = ggml_cpy(ctx, a, dst);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) H * tokens);
+        fill_random_f32(ha.data(), ha.size(), 271);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "CPY", "F32->F16", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// GLU SWIGLU split: gate * swish(up), inputs [hidden, tokens]
+static void grid_glu_swiglu_split_f32(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t H = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, tokens);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, tokens);
+    ggml_tensor * c = ggml_swiglu_split(ctx, a, b);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float> ha((size_t) H * tokens), hb((size_t) H * tokens);
+        fill_random_f32(ha.data(), ha.size(), 281);
+        fill_random_f32(hb.data(), hb.size(), 282);
+        ggml_backend_tensor_set(a, ha.data(), 0, ha.size() * sizeof(float));
+        ggml_backend_tensor_set(b, hb.data(), 0, hb.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "GLU_SWIGLU_SPLIT", "F32", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// MUL_MAT F16 weight × F32 act -> F32 out, [K=4096, N=4096, M=tokens]
+static void grid_mul_mat_f16(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t K = 4096, N = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, N);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, tokens);
+    ggml_tensor * c = ggml_mul_mat(ctx, w, x);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float>       w_f32((size_t) K * N);
+        std::vector<ggml_fp16_t> w_f16((size_t) K * N);
+        std::vector<float>       hx((size_t) K * tokens);
+        fill_random_f32(w_f32.data(), w_f32.size(), 291);
+        fill_random_f32(hx.data(),    hx.size(),    292);
+        ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), w_f16.size());
+        ggml_backend_tensor_set(w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(x, hx.data(),    0, hx.size()    * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "MUL_MAT", "F16w-F32act", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// MUL_MAT Q4_K weight × F32 act -> F32 out (per-token quantized matmul)
+static void grid_mul_mat_q4_k(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t K = 4096, N = 4096;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, K, N);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  K, tokens);
+    ggml_tensor * c = ggml_mul_mat(ctx, w, x);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float>   w_f32((size_t) K * N);
+        std::vector<uint8_t> w_q((size_t) N * ggml_row_size(GGML_TYPE_Q4_K, K));
+        std::vector<float>   hx((size_t) K * tokens);
+        fill_random_f32(w_f32.data(), w_f32.size(), 301);
+        fill_random_f32(hx.data(),    hx.size(),    302);
+        ggml_quantize_chunk(GGML_TYPE_Q4_K, w_f32.data(), w_q.data(), 0, N, K, nullptr);
+        ggml_backend_tensor_set(w, w_q.data(), 0, w_q.size());
+        ggml_backend_tensor_set(x, hx.data(),  0, hx.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "MUL_MAT", "Q4_Kw-F32act", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// MUL_MAT_ID F16 weight MoE: K=4096, N=4096, M=tokens, n_expert=8, n_used=2
+static void grid_mul_mat_id_f16(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t K = 4096, N = 4096;
+    const int64_t n_expert = 8, n_used = 2;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * w   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, N, n_expert);
+    ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_used, tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, tokens);
+    ggml_tensor * c   = ggml_mul_mat_id(ctx, w, b, ids);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        std::vector<float>       w_f32((size_t) K * N * n_expert);
+        std::vector<ggml_fp16_t> w_f16((size_t) K * N * n_expert);
+        std::vector<float>       hb((size_t) K * n_used * tokens);
+        std::vector<int32_t>     hids((size_t) n_used * tokens);
+        fill_random_f32(w_f32.data(), w_f32.size(), 311);
+        fill_random_f32(hb.data(),    hb.size(),    312);
+        ggml_fp32_to_fp16_row(w_f32.data(), w_f16.data(), w_f16.size());
+        for (size_t i = 0; i < hids.size(); i++) hids[i] = (int32_t)(i % n_expert);
+        ggml_backend_tensor_set(w,   w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(b,   hb.data(),    0, hb.size()    * sizeof(float));
+        ggml_backend_tensor_set(ids, hids.data(),  0, hids.size()  * sizeof(int32_t));
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, c);
+        time_graph_grid(gcu, graph, "MUL_MAT_ID", "F16w-F32act-MoE8/2", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+// FLASH_ATTN_EXT decode/prefill grid: head_dim=128, n_head=16, n_head_kv=8,
+// n_q=tokens, n_kv=128 (context). Token-length varies the query length.
+static void grid_flash_attn_ext(ggml_backend_t gcu, int64_t tokens) {
+    const int64_t head_dim = 128, n_head = 16, n_head_kv = 8, n_kv = 128, n_batch = 1;
+    auto buft = ggml_backend_get_default_buffer_type(gcu);
+    auto p = bench_init_params();
+    ggml_context * ctx = ggml_init(p);
+
+    ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, tokens,  n_head,    n_batch);
+    ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv,    n_head_kv, n_batch);
+    ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, head_dim, n_kv,    n_head_kv, n_batch);
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, tokens, 1, 1);
+
+    const float scale = 1.0f / std::sqrt((float) head_dim);
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf) {
+        const size_t nq    = (size_t) head_dim * tokens * n_head    * n_batch;
+        const size_t nkv   = (size_t) head_dim * n_kv   * n_head_kv * n_batch;
+        const size_t nmask = (size_t) n_kv * tokens;
+
+        std::vector<float>       hq_f32(nq);
+        std::vector<float>       hk_f32(nkv), hv_f32(nkv), hmask_f32(nmask, 0.0f);
+        std::vector<ggml_fp16_t> hk(nkv), hv(nkv), hmask(nmask);
+        fill_random_f32(hq_f32.data(), nq,  321);
+        fill_random_f32(hk_f32.data(), nkv, 322);
+        fill_random_f32(hv_f32.data(), nkv, 323);
+        ggml_fp32_to_fp16_row(hk_f32.data(),    hk.data(),    nkv);
+        ggml_fp32_to_fp16_row(hv_f32.data(),    hv.data(),    nkv);
+        ggml_fp32_to_fp16_row(hmask_f32.data(), hmask.data(), nmask);
+
+        ggml_backend_tensor_set(q,    hq_f32.data(), 0, nq    * sizeof(float));
+        ggml_backend_tensor_set(k,    hk.data(),     0, nkv   * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(v,    hv.data(),     0, nkv   * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(mask, hmask.data(),  0, nmask * sizeof(ggml_fp16_t));
+
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        time_graph_grid(gcu, graph, "FLASH_ATTN_EXT", "F16kv-F32q", tokens);
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+}
+
+static void bench_token_grid_all(ggml_backend_t gcu) {
+    if (getenv("GCU_BENCH_TOKEN_GRID") == nullptr) return;
+    printf("---- per-op token-length-grid perf ----\n");
+    for (int64_t tokens : kBenchTokenGrid) {
+        grid_binary_2d_f32(gcu, tokens, "ADD", ggml_add, 401);
+        grid_binary_2d_f32(gcu, tokens, "MUL", ggml_mul, 403);
+        grid_scale_f32(gcu, tokens);
+        grid_unary_2d_f32(gcu, tokens, "SILU", ggml_silu, 405);
+        grid_unary_2d_f32(gcu, tokens, "GELU", ggml_gelu, 407);
+        grid_unary_2d_f32(gcu, tokens, "RELU", ggml_relu, 409);
+        grid_rms_norm_f32(gcu, tokens);
+        grid_norm_f32(gcu, tokens);
+        grid_softmax_f32(gcu, tokens);
+        grid_rope_f32(gcu, tokens);
+        grid_cpy_f32_f16(gcu, tokens);
+        grid_glu_swiglu_split_f32(gcu, tokens);
+        grid_mul_mat_f16(gcu, tokens);
+        grid_mul_mat_q4_k(gcu, tokens);
+        grid_mul_mat_id_f16(gcu, tokens);
+        grid_flash_attn_ext(gcu, tokens);
+    }
 }
 
 int main() {
@@ -5829,6 +6298,9 @@ int main() {
     rc |= test_moe_gate_up_geglu(gcu);
     rc |= test_flash_attn_ext_small(gcu);
     rc |= test_flash_attn_ext_decode(gcu);
+    if (getenv("GCU_TEST_FA_FANOUT") != nullptr) {
+        rc |= test_flash_attn_ext_perf_fanout(gcu);
+    }
     rc |= test_argmax(gcu);
     rc |= test_argmax_f16(gcu);
     rc |= test_argmax_vocab(gcu);
@@ -5847,8 +6319,11 @@ int main() {
     rc |= test_repeat(gcu);
     rc |= test_async_overlap(gcu);
 
-    const bool bench_ran = (rc == 0 && getenv("GCU_BENCH") != nullptr);
+    const bool bench_ran     = (rc == 0 && getenv("GCU_BENCH") != nullptr);
+    const bool grid_ran      = (rc == 0 && getenv("GCU_BENCH_TOKEN_GRID") != nullptr);
+    const bool fa_fanout_ran = (rc == 0 && getenv("GCU_TEST_FA_FANOUT") != nullptr);
     if (bench_ran) bench_all(gcu);
+    if (grid_ran)  bench_token_grid_all(gcu);
 
     ggml_backend_free(gcu);
 
@@ -5860,11 +6335,15 @@ int main() {
     // exit). So a strict leak check would always trip. Print the delta
     // as info, and only flag truly extreme values as failure. The bench
     // section legitimately loads ~1 GiB of MoE-shape weight scratch into
-    // the pool, so raise the threshold when bench mode ran.
+    // the pool, so raise the threshold when bench mode ran. The
+    // FA fanout regression test (GCU_TEST_FA_FANOUT=1) also fills the pool
+    // with 4 MiB K/V scratch slabs by design — those exercise the
+    // deferred-frees cap path — so we raise the threshold for it too.
     if (total_after == total_before && free_before > free_after) {
         size_t diff = free_before - free_after;
         printf("retained device memory: %zu bytes (pool + topsaten workspace)\n", diff);
-        const size_t leak_threshold = bench_ran ? ((size_t) 4 << 30) : ((size_t) 1 << 30);
+        const size_t leak_threshold =
+            (bench_ran || grid_ran || fa_fanout_ran) ? ((size_t) 4 << 30) : ((size_t) 1 << 30);
         if (diff > leak_threshold) {
             fprintf(stderr, "leak detected: %zu bytes retained (>%zu GiB)\n",
                     diff, leak_threshold >> 30);
