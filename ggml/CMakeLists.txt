@@ -327,6 +327,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-blas.h
     include/ggml-cann.h
     include/ggml-cpp.h
+    include/ggml-gcu.h
     include/ggml-cuda.h
     include/ggml-opt.h
     include/ggml-metal.h
