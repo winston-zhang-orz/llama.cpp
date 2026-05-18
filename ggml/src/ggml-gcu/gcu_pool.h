@@ -90,13 +90,34 @@ private:
 
 #define GGML_GCU_NAME_MAX 64
 
+// RAII guard for the process-level topsaten init refcount. Declared as
+// the first owned member so it is constructed first (topsSetDevice +
+// gcu_global_init_inc before any stream/event is created) and destroyed
+// last (gcu_global_init_dec after every stream/event has been torn
+// down) — byte-for-byte the pre-RAII ctor/dtor ordering.
+struct gcu_init_guard {
+    explicit gcu_init_guard(int32_t dev) {
+        TOPS_CHECK(topsSetDevice(dev));
+        gcu_global_init_inc();
+    }
+    ~gcu_init_guard() { gcu_global_init_dec(); }
+    gcu_init_guard(const gcu_init_guard &)             = delete;
+    gcu_init_guard & operator=(const gcu_init_guard &) = delete;
+};
+
 struct ggml_backend_gcu_context {
-    int32_t      device      = 0;
+    int32_t        device = 0;
+    gcu_init_guard init_guard;  // first owned member: see comment above
     std::string  name;          // "GCU0", "GCU1", ...
     std::string  description;   // populated from topsGetDeviceProperties
-    topsStream_t compute_stream = nullptr;
-    topsStream_t copy_stream    = nullptr;
+    // pool is declared before the streams so it destroys *after* them
+    // (reverse order): the pre-RAII dtor synchronized+destroyed the
+    // streams first and only then let the pool drain (topsFree the cached
+    // slabs). Keeping that order avoids freeing device memory while a
+    // stream still references it.
     gcu_pool     pool;
+    gcu_stream   compute_stream;
+    gcu_stream   copy_stream;
 
     // Per-context zero-filled scratch used as bias for topsatenLinear's
     // mandatory bias parameter. Grows on demand to the largest output row
@@ -117,8 +138,8 @@ struct ggml_backend_gcu_context {
     // last_compute_event:   recorded on compute_stream at end of graph_compute
     // copy_event_armed:     guards the first wait — recording-without-arming is undefined SDK behavior
     // compute_event_armed:  symmetric guard for get_tensor_async; set by graph_compute (Task 3)
-    topsEvent_t  last_copy_event    = nullptr;
-    topsEvent_t  last_compute_event = nullptr;
+    gcu_event    last_copy_event;
+    gcu_event    last_compute_event;
     bool         copy_event_armed   = false;
     bool         compute_event_armed = false;
 
@@ -158,14 +179,15 @@ struct ggml_backend_gcu_context {
         }
     }
 
-    explicit ggml_backend_gcu_context(int32_t dev) : device(dev), pool(dev) {
+    // Member construction order (= declaration order): device, init_guard
+    // (topsSetDevice + gcu_global_init_inc), compute_stream, copy_stream,
+    // pool, last_copy_event, last_compute_event — the exact pre-RAII ctor
+    // sequence. Destruction runs in reverse, matching the pre-RAII dtor:
+    // events, then streams (each synchronizes before destroy), then pool,
+    // then init_guard (gcu_global_init_dec last).
+    explicit ggml_backend_gcu_context(int32_t dev)
+        : device(dev), init_guard(dev), pool(dev) {
         deferred_frees.reserve(64);
-        TOPS_CHECK(topsSetDevice(device));
-        gcu_global_init_inc();
-        TOPS_CHECK(topsStreamCreate(&compute_stream));
-        TOPS_CHECK(topsStreamCreate(&copy_stream));
-        TOPS_CHECK(topsEventCreateWithFlags(&last_copy_event,    topsEventDisableTiming));
-        TOPS_CHECK(topsEventCreateWithFlags(&last_compute_event, topsEventDisableTiming));
 
         char buf[GGML_GCU_NAME_MAX];
         snprintf(buf, sizeof(buf), "GCU%d", device);
@@ -191,25 +213,9 @@ struct ggml_backend_gcu_context {
             zero_bias = nullptr;
             zero_bias_bytes = 0;
         }
-        if (last_compute_event) {
-            TOPS_CHECK(topsEventDestroy(last_compute_event));
-            last_compute_event = nullptr;
-        }
-        if (last_copy_event) {
-            TOPS_CHECK(topsEventDestroy(last_copy_event));
-            last_copy_event = nullptr;
-        }
-        if (copy_stream) {
-            TOPS_CHECK(topsStreamSynchronize(copy_stream));
-            TOPS_CHECK(topsStreamDestroy(copy_stream));
-            copy_stream = nullptr;
-        }
-        if (compute_stream) {
-            TOPS_CHECK(topsStreamSynchronize(compute_stream));
-            TOPS_CHECK(topsStreamDestroy(compute_stream));
-            compute_stream = nullptr;
-        }
-        gcu_global_init_dec();
+        // Streams / events / init refcount released by member destructors
+        // (gcu_stream / gcu_event / gcu_init_guard) in reverse declaration
+        // order — see the ctor comment.
     }
 
     ggml_backend_gcu_context(const ggml_backend_gcu_context &) = delete;

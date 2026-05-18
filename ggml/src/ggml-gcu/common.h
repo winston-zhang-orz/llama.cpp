@@ -53,6 +53,52 @@ const char * topsaten_status_to_str(topsatenStatus_t s);
         }                                                                           \
     } while (0)
 
+// === RAII wrappers for topsrt stream / event handles ================
+//
+// Thin owning wrappers around topsStream_t / topsEvent_t. Construction
+// allocates the handle, destruction releases it (a stream synchronizes
+// before destroy, matching the pre-RAII manual cleanup). Copy is deleted;
+// move transfers ownership. The implicit conversion operator lets a
+// wrapper be passed anywhere the raw handle was used before, so op call
+// sites are unchanged.
+
+class gcu_stream {
+public:
+    gcu_stream() { TOPS_CHECK(topsStreamCreate(&s_)); }
+    ~gcu_stream() {
+        if (s_) {
+            TOPS_CHECK(topsStreamSynchronize(s_));
+            TOPS_CHECK(topsStreamDestroy(s_));
+        }
+    }
+    gcu_stream(const gcu_stream &)             = delete;
+    gcu_stream & operator=(const gcu_stream &) = delete;
+    gcu_stream(gcu_stream && o) noexcept : s_(o.s_) { o.s_ = nullptr; }
+
+    operator topsStream_t() const { return s_; }
+
+private:
+    topsStream_t s_ = nullptr;
+};
+
+class gcu_event {
+public:
+    gcu_event() { TOPS_CHECK(topsEventCreateWithFlags(&e_, topsEventDisableTiming)); }
+    ~gcu_event() {
+        if (e_) {
+            TOPS_CHECK(topsEventDestroy(e_));
+        }
+    }
+    gcu_event(const gcu_event &)             = delete;
+    gcu_event & operator=(const gcu_event &) = delete;
+    gcu_event(gcu_event && o) noexcept : e_(o.e_) { o.e_ = nullptr; }
+
+    operator topsEvent_t() const { return e_; }
+
+private:
+    topsEvent_t e_ = nullptr;
+};
+
 // === Tensor mapping =================================================
 //
 // Convert a ggml_tensor descriptor into a topsatenTensor that wraps the
