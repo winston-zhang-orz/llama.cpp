@@ -29,6 +29,7 @@ set(GGML_SOURCES_GCU
     gcu_op_elementwise.cpp
     gcu_op_norm.cpp
     gcu_op_matmul.cpp
+    gcu_op_attn.cpp
 )
 
 ggml_add_backend_library(ggml-gcu ${GGML_SOURCES_GCU})
