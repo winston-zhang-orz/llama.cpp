@@ -19,7 +19,12 @@ if (NOT EXISTS "${TOPS_INSTALL_DIR}/include/gcu/topsaten/topsaten.h")
         "Install the tops-sdk and topsaten packages, or pass -DTOPS_INSTALL_DIR=...")
 endif()
 
-file(GLOB GGML_SOURCES_GCU "*.cpp")
+# Explicit source list (preferred over a glob so a missed file fails the
+# build loudly rather than silently dropping a translation unit).
+set(GGML_SOURCES_GCU
+    ggml-gcu.cpp
+    common.cpp
+)
 
 ggml_add_backend_library(ggml-gcu ${GGML_SOURCES_GCU})
 
